@@ -7,7 +7,7 @@ Current software and hardware scope:
 
 - Runtime mode: **Colocate** (FSDP actor + vLLM rollout on the same device).
 - Inference engine: **vLLM** validated. SGLang weight sync not yet supported
-  on Intel GPU — see [`faq.md`](faq.md).
+  on Intel GPU.
 - Trainer backend: **FSDP**, **FSDP2**. Megatron not yet validated.
 - Algorithms: GRPO, PPO, SFT — validated on GSM8K / Qwen2.5.
 - Hardware targets:
@@ -25,9 +25,7 @@ python3 examples/data_preprocess/gsm8k.py --local_save_dir ~/data/gsm8k
 
 ```bash
 export ZE_AFFINITY_MASK=0,1            # select physical device indices
-unset ONEAPI_DEVICE_SELECTOR           # must NOT be set — see faq.md
-export RAY_memory_monitor_refresh_ms=0
-export RAY_NUM_PRESTART_PYTHON_WORKERS=0
+unset ONEAPI_DEVICE_SELECTOR           # must NOT be set
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -81,7 +79,5 @@ timing_s/step: ~93   perf/throughput: ~41 tok/s
 | Hardware (2-GPU) | Validated | Arc Pro B60 x2: 93.0 s/step at same batch size |
 | Multi-node | Not yet tested | — |
 
-See [`faq.md`](faq.md) for known limitations (Level Zero VA pressure, SGLang
-weight sync, `ONEAPI_DEVICE_SELECTOR`, FSDP2 + oneCCL AVG reduce) and
-[`docker/intel_gpu/README.md`](../../docker/intel_gpu/README.md) for a
+See [`docker/intel_gpu/README.md`](../../docker/intel_gpu/README.md) for a
 containerized environment with all of the above preconfigured.
