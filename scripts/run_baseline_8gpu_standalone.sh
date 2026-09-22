@@ -35,11 +35,6 @@ export CCL_BUFFER_CACHE=0
 export CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=0
 export CCL_TOPO_ALGO=0
 
-# Level-Zero VA-space pressure scales with colocated Ray worker count --
-# 8 GPUs means 8x the workers of what we validated at 2 GPUs.
-export RAY_memory_monitor_refresh_ms=0
-export RAY_NUM_PRESTART_PYTHON_WORKERS=0
-
 echo "=== data prep (GSM8K) ==="
 DATA_DIR=${DATA_DIR:-"$HOME/data/gsm8k"}
 mkdir -p "$DATA_DIR"
