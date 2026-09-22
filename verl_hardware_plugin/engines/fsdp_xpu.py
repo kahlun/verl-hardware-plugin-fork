@@ -72,8 +72,8 @@ class FSDPXPUEngineWithLMHead(FSDPEngineWithLMHead):
         """
         super().initialize()
         # xccl does not support ReduceOp.AVG; force sum-based reduction
-        if hasattr(self.model, "set_force_sum_reduction_for_comms"):
-            self.model.set_force_sum_reduction_for_comms(True)
+        if hasattr(self.module, "set_force_sum_reduction_for_comms"):
+            self.module.set_force_sum_reduction_for_comms(True)
             logger.info("Enabled force_sum_reduction_for_comms for XPU")
 
 
@@ -98,5 +98,5 @@ class FSDPXPUEngineWithValueHead(FSDPEngineWithValueHead):
     def initialize(self):
         """Initialize the FSDP value model, then apply xccl workaround."""
         super().initialize()
-        if hasattr(self.model, "set_force_sum_reduction_for_comms"):
-            self.model.set_force_sum_reduction_for_comms(True)
+        if hasattr(self.module, "set_force_sum_reduction_for_comms"):
+            self.module.set_force_sum_reduction_for_comms(True)
