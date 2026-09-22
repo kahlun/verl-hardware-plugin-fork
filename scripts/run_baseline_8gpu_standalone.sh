@@ -76,4 +76,4 @@ cd /opt/verl-hardware-plugin
 # Not XPU-specific -- would hit any device with a tied-embedding model.
 # Workaround: make the bucket bigger than the whole (small) model so
 # everything ships in one call. Qwen3-0.6B easily fits under 8192 MB.
-bash scripts/baseline_grpo_gsm8k.sh +actor_rollout_ref.rollout.update_weights_bucket_megabytes=8192
+bash scripts/baseline_grpo_gsm8k.sh actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=8192
