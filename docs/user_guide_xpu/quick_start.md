@@ -78,6 +78,7 @@ timing_s/step: ~93   perf/throughput: ~41 tok/s
 | Hardware (1-GPU) | Validated | Arc Pro B60: 51.2 s/step, 148.2 tok/s (batch 16, Qwen2.5-0.5B) |
 | Hardware (2-GPU) | Validated | Arc Pro B60 x2: 93.0 s/step at same batch size |
 | Multi-node | Not yet tested | — |
+| Profiler | Intel VTune (ITT) | Set `profiler.tool: vtune`; requires verl-core with [verl#7917](https://github.com/verl-project/verl/pull/7917) (see install_guidance.md) |
 
 See [`docker/intel_gpu/README.md`](../../docker/intel_gpu/README.md) for a
 containerized environment with all of the above preconfigured.
