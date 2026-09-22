@@ -20,22 +20,41 @@ def _stub_training_engine_runtimes():
     The lightweight bases let the complete registry suite run on a CPU-only CI host.
     """
 
-    class _ImportPlaceholder:
+    # BaseEngine must come from a real, unmocked import -- it's the base class
+    # _StubEngine below needs, and importing it here (before any sys.modules
+    # patching) runs verl/workers/engine/__init__.py for real, which resolves
+    # cleanly on its own (its try/except ImportError guards handle the
+    # genuinely-missing torchtitan/veomni/automodel/mindspeed/megatron
+    # packages already).
+    from verl.workers.engine.base import BaseEngine
+
+    class _StubEngine(BaseEngine):
         pass
 
+    # Populate every module attribute with _StubEngine *before* patching
+    # sys.modules, not after. verl/workers/engine/__init__.py's mindspeed
+    # import defines `class MindspeedEngineWithLMHead(MegatronEngineWithLMHead)`
+    # with a live @EngineRegistry.register(...) decorator that asserts
+    # issubclass(engine_class, BaseEngine) *at class-definition time*. If
+    # that import gets re-triggered while these are still placeholders (as
+    # they were here until the `yield`), the assertion fails for real --
+    # confirmed via AssertionError at verl/workers/engine/base.py:376 on
+    # real hardware. Only the plugin's own subsequent imports need to see
+    # the stub; verl-core's internal mindspeed/megatron wiring never should.
     fsdp = ModuleType("verl.workers.engine.fsdp")
-    fsdp.FSDPEngine = _ImportPlaceholder
-    fsdp.FSDPEngineWithLMHead = _ImportPlaceholder
+    fsdp.FSDPEngine = _StubEngine
+    fsdp.FSDPEngineWithLMHead = _StubEngine
+    fsdp.FSDPTurboEngineWithLMHead = _StubEngine
 
     fsdp_transformer = ModuleType("verl.workers.engine.fsdp.transformer_impl")
-    fsdp_transformer.FSDPEngine = _ImportPlaceholder
-    fsdp_transformer.FSDPEngineWithLMHead = _ImportPlaceholder
-    fsdp_transformer.FSDPEngineWithValueHead = _ImportPlaceholder
+    fsdp_transformer.FSDPEngine = _StubEngine
+    fsdp_transformer.FSDPEngineWithLMHead = _StubEngine
+    fsdp_transformer.FSDPEngineWithValueHead = _StubEngine
 
     megatron_transformer = ModuleType("verl.workers.engine.megatron.transformer_impl")
-    megatron_transformer.MegatronEngine = _ImportPlaceholder
-    megatron_transformer.MegatronEngineWithLMHead = _ImportPlaceholder
-    megatron_transformer.MegatronEngineWithValueHead = _ImportPlaceholder
+    megatron_transformer.MegatronEngine = _StubEngine
+    megatron_transformer.MegatronEngineWithLMHead = _StubEngine
+    megatron_transformer.MegatronEngineWithValueHead = _StubEngine
 
     engine_modules = {
         "verl.workers.engine.fsdp": fsdp,
@@ -46,19 +65,6 @@ def _stub_training_engine_runtimes():
         mock.patch.dict(os.environ, {"VERL_USE_EXTERNAL_PLUGINS": "none"}),
         mock.patch.dict(sys.modules, engine_modules),
     ):
-        from verl.workers.engine.base import BaseEngine
-
-        class _StubEngine(BaseEngine):
-            pass
-
-        fsdp.FSDPEngine = _StubEngine
-        fsdp.FSDPEngineWithLMHead = _StubEngine
-        fsdp_transformer.FSDPEngine = _StubEngine
-        fsdp_transformer.FSDPEngineWithLMHead = _StubEngine
-        fsdp_transformer.FSDPEngineWithValueHead = _StubEngine
-        megatron_transformer.MegatronEngine = _StubEngine
-        megatron_transformer.MegatronEngineWithLMHead = _StubEngine
-        megatron_transformer.MegatronEngineWithValueHead = _StubEngine
         yield
 
 
