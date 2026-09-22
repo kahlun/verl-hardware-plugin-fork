@@ -22,13 +22,15 @@ verl_hardware_plugin/
 user_guide_xpu/
 ├── README.md              # This file
 ├── install_guidance.md    # Installation guide
-└── quick_start.md         # Quick start
+├── quick_start.md         # Quick start
+└── profiling.md           # Intel VTune (ITT) profiling
 ```
 
 ## Getting Started
 
 - [Installation Guide](./install_guidance.md) — prerequisites and environment setup
 - [Quick Start](./quick_start.md) — run a GRPO training example and verify the platform
+- [Profiling](./profiling.md) — capture an Intel VTune (ITT) trace
 
 ## Platform Summary
 
