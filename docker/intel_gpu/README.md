@@ -61,7 +61,6 @@ into the image:
 ```bash
 docker run -it --rm --device /dev/dri --group-add ${RENDER_GID} \
   --shm-size 16g -v $HOME/data:/root/data \
-  -e CCL_ATL_SHM=1 \
   verl-intel-gpu:latest
 ```
 
@@ -88,22 +87,3 @@ Runtime sanity checks validated on this image:
 - Default rollout backend on Intel GPU is vLLM.
 - sglang is not the default path for Intel GPU in this image.
 - Separate image/profile will be released when SGLang is validated on Intel GPU.
-
-## Known Workarounds (pre-DLE 2026.0 driver)
-
-Multi-GPU requires these environment variables due to Level Zero IPC limitations:
-
-```bash
-export CCL_ATL_SHM=1        # Route collectives via /dev/shm
-export CCL_BUFFER_CACHE=0    # Prevent stale IPC handle cache
-```
-
-Also commonly required in multi-GPU runs:
-
-```bash
-export CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=0
-export CCL_TOPO_ALGO=0
-```
-
-These should be treated as temporary runtime workarounds and revisited when upgrading
-to newer driver and PyTorch releases.
