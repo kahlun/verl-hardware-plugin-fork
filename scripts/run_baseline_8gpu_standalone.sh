@@ -66,4 +66,14 @@ fi
 
 echo "=== Acceptance Baseline: GRPO/GSM8K/Qwen3-0.6B, NGPUS_PER_NODE=${NGPUS_PER_NODE} ==="
 cd /opt/verl-hardware-plugin
-bash scripts/baseline_grpo_gsm8k.sh
+# vLLM >=0.29.0 (this image's pin) added AutoWeightsLoader._check_skipped_aliases():
+# each load_weights() call now validates tied-weight completeness on its own.
+# verl's bucketed weight-sync calls load_weights() once per bucket with no
+# accumulation (verl/workers/rollout/vllm_rollout/utils.py), so if
+# lm_head.weight and its tied target model.embed_tokens.weight land in
+# different buckets, this crashes with "was skipped because it is tied to
+# ... but ... was not found in the checkpoint". Doesn't exist in vLLM 0.27.0.
+# Not XPU-specific -- would hit any device with a tied-embedding model.
+# Workaround: make the bucket bigger than the whole (small) model so
+# everything ships in one call. Qwen3-0.6B easily fits under 8192 MB.
+bash scripts/baseline_grpo_gsm8k.sh actor_rollout_ref.rollout.update_weights_bucket_megabytes=8192
