@@ -5,11 +5,14 @@ Last updated: 09/22/2026.
 This guide describes Intel VTune (ITT) profiling support in `verl-hardware-plugin`
 for Intel XPU. Unlike Cambricon MLU's profiling support (see
 [`user_guide_mlu/profiling.md`](../user_guide_mlu/profiling.md)), which reuses
-verl's built-in `global_profiler.tool=torch` path, there is no PyTorch-native
-profiler activity for Intel XPU equivalent to `torch.profiler.ProfilerActivity.MLU`.
-VTune support is wired in purely through the newer `PlatformBase` plugin hooks —
+verl's built-in `global_profiler.tool=torch` path via a plugin-side monkey-patch,
+VTune is wired in purely through the newer `PlatformBase` plugin hooks —
 `PlatformXPU.profiler_markers()` and `PlatformXPU.dist_profiler_cls()` — which
-verl core discovers without needing to know about ITT or XPU itself.
+verl core discovers without needing to know about ITT or XPU itself. `torch.profiler`
+support for XPU is also possible (`torch.profiler.ProfilerActivity.XPU` exists
+natively — more natively than MLU's own activity, which needs `torch_mlu` to
+register it) — see "Torch Profiler" below; that path is proposed, not yet
+implemented in verl-core.
 
 ## Prerequisites
 
@@ -76,6 +79,31 @@ open `./vtune_results` in the VTune GUI/CLI instead. Because `profiler_start`/
 `profiler_stop` are no-ops, `tool_config.discrete` has little practical effect
 for `vtune` specifically (unlike `torch`/`nsys`, where it materially changes
 what gets recorded) — the ITT ranges are emitted the same way either way.
+
+## Torch Profiler (proposed — not yet implemented)
+
+An alternative to VTune: a self-contained Chrome-trace file via verl's built-in
+`torch` tool, the same one CUDA/MLU use, instead of an externally-attached
+collector. This needs two new optional `PlatformBase` hooks
+(`torch_profiler_activity()`/`torch_profiler_content_name()`) that do not exist
+in verl-core yet — `PlatformXPU`'s side of it is implemented on this branch,
+but it has no effect until the matching verl-core change lands (see the
+companion proposal in `verl-core`'s `feature/torch-profiler-plugin-hook`
+branch). Once both land, the recipe would be:
+
+```bash
+python -m verl.trainer.main_ppo \
+  ... \
+  actor_rollout_ref.actor.profiler.tool=torch \
+  actor_rollout_ref.actor.profiler.enable=True \
+  actor_rollout_ref.actor.profiler.tool_config.torch.contents=[xpu,cpu,memory,shapes,stack]
+```
+
+Unlike VTune, this writes a self-contained `.json.gz` Chrome trace under
+`global_profiler.save_path` — no external collector needed, open directly in
+`chrome://tracing` or Perfetto. Not yet verified against real hardware: whether
+`torch.profiler.profile(activities=[CPU, XPU])` actually produces a populated,
+correct trace on Intel Arc/oneAPI has not been tested.
 
 ## Troubleshooting
 

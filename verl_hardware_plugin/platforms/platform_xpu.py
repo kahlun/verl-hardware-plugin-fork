@@ -269,6 +269,16 @@ class PlatformXPU(PlatformBase):
 
         return VtuneProfiler
 
+    def torch_profiler_activity(self):
+        # Lets `verl/utils/profiler/torch_profile.py::get_torch_profiler` collect
+        # XPU device activity when `profiler.tool_config.torch.contents` includes
+        # "xpu". Requires PlatformBase.torch_profiler_activity()/
+        # torch_profiler_content_name() (verl-project/verl, not yet merged).
+        return getattr(torch.profiler.ProfilerActivity, "XPU", None)
+
+    def torch_profiler_content_name(self) -> str:
+        return "xpu"
+
     # ------------------------------------------------------------------
     # Model patches
     # ------------------------------------------------------------------
