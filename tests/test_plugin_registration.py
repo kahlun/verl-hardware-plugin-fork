@@ -26,6 +26,7 @@ def _stub_training_engine_runtimes():
     fsdp = ModuleType("verl.workers.engine.fsdp")
     fsdp.FSDPEngine = _ImportPlaceholder
     fsdp.FSDPEngineWithLMHead = _ImportPlaceholder
+    fsdp.FSDPTurboEngineWithLMHead = _ImportPlaceholder
 
     fsdp_transformer = ModuleType("verl.workers.engine.fsdp.transformer_impl")
     fsdp_transformer.FSDPEngine = _ImportPlaceholder
@@ -53,6 +54,7 @@ def _stub_training_engine_runtimes():
 
         fsdp.FSDPEngine = _StubEngine
         fsdp.FSDPEngineWithLMHead = _StubEngine
+        fsdp.FSDPTurboEngineWithLMHead = _StubEngine
         fsdp_transformer.FSDPEngine = _StubEngine
         fsdp_transformer.FSDPEngineWithLMHead = _StubEngine
         fsdp_transformer.FSDPEngineWithValueHead = _StubEngine
