@@ -13,6 +13,13 @@ Why is this engine needed?
     followed by manual division, which is functionally equivalent but
     compatible with xccl.
 
+    verl core also exposes this as PlatformXPU.is_reduce_avg_supported()
+    (platforms/platform_xpu.py) as of the verl PR that added that hook —
+    once a pinned verl version calls it automatically from apply_fsdp2(),
+    the force_sum_reduction_for_comms() call below becomes redundant with
+    what the platform hook already does. Kept here for now so this plugin
+    still works against older verl versions that predate that hook.
+
 Registration:
     @EngineRegistry.register(device="xpu", vendor="intel")
     This means verl will automatically select this engine when:
@@ -65,8 +72,8 @@ class FSDPXPUEngineWithLMHead(FSDPEngineWithLMHead):
         """
         super().initialize()
         # xccl does not support ReduceOp.AVG; force sum-based reduction
-        if hasattr(self.model, "set_force_sum_reduction_for_comms"):
-            self.model.set_force_sum_reduction_for_comms(True)
+        if hasattr(self.module, "set_force_sum_reduction_for_comms"):
+            self.module.set_force_sum_reduction_for_comms(True)
             logger.info("Enabled force_sum_reduction_for_comms for XPU")
 
 
@@ -91,5 +98,5 @@ class FSDPXPUEngineWithValueHead(FSDPEngineWithValueHead):
     def initialize(self):
         """Initialize the FSDP value model, then apply xccl workaround."""
         super().initialize()
-        if hasattr(self.model, "set_force_sum_reduction_for_comms"):
-            self.model.set_force_sum_reduction_for_comms(True)
+        if hasattr(self.module, "set_force_sum_reduction_for_comms"):
+            self.module.set_force_sum_reduction_for_comms(True)
