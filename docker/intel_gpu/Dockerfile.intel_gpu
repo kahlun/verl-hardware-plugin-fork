@@ -55,12 +55,12 @@ LABEL org.opencontainers.image.vendor="verl-hardware-plugin"
 ARG DEBIAN_FRONTEND=noninteractive
 ARG PYTHON_VERSION=3.12
 
-# vLLM pinned to the v0.27.0 release tag — the first stable release that carries
-# the XPU torch==2.13.0 + vllm_xpu_kernels 0.1.12 pairing. requirements/xpu.txt at
-# v0.27.0 is byte-identical to the previously-pinned commit 5b29c958 (which is
-# v0.27.0rc1~173, i.e. an ancestor of this tag), so the torch/oneCCL/driver stack
+# vLLM pinned to the v0.29.0 release tag — the first stable release that carries
+# the XPU torch==2.13.0 + vllm_xpu_kernels 0.1.14.1 pairing. requirements/xpu.txt at
+# v0.29.0 is byte-identical to the previously-pinned commit 5b29c958 (which is
+# v0.29.0rc1~173, i.e. an ancestor of this tag), so the torch/oneCCL/driver stack
 # below is unchanged — this just swaps the commit pin for the stable tag.
-ARG VLLM_VERSION=v0.27.0
+ARG VLLM_VERSION=v0.29.0
 
 # torch version is intentionally not pinned here. vLLM's requirements/xpu.txt
 # owns the tested torch+xpu pairing for each vLLM commit.
@@ -188,8 +188,13 @@ RUN uv pip uninstall triton triton-xpu -y 2>/dev/null || true && \
     uv pip install triton-xpu==3.7.1 --extra-index-url https://download.pytorch.org/whl/xpu
 
 # --- Layer 3: this plugin (verl_hardware_plugin), from the local build context ---
-WORKDIR /workspace/verl-hardware-plugin
-COPY . /workspace/verl-hardware-plugin
+# Installed at /opt/, NOT /workspace/ — devctl (and similar workspace-PVC
+# tooling) mounts a session PVC AT /workspace, replacing everything image-baked
+# under it with only /workspace/local + /workspace/remote. An editable install
+# rooted under /workspace would go invisible the moment such a PVC mounts,
+# exactly like verl-core did before it was moved to /opt/verl above.
+WORKDIR /opt/verl-hardware-plugin
+COPY . /opt/verl-hardware-plugin
 # --no-deps: pyproject.toml declares "verl>=0.7.0" as a dependency, but we want
 # the pinned checkout installed at /opt/verl above (Layer 2), not a PyPI verl
 # release silently overwriting it.
