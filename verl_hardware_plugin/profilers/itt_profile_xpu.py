@@ -94,14 +94,21 @@ class VtuneProfiler(DistProfiler):
     externally as a collector and observes range_push/range_pop events, so
     PlatformXPU.profiler_start/profiler_stop are no-ops by design — the ranges
     emitted by mark_start_range/mark_end_range are the real signal.
+
+    Because those two hooks are no-ops, ``tool_config.discrete`` has no effect on
+    XPU: both values behave identically. It is read only to keep the DistProfiler
+    contract, so a missing tool_config is not an error here.
     """
 
     def __init__(self, rank: int, config: Optional[ProfilerConfig], tool_config: Optional[NsightToolConfig], **kwargs):
         if not config:
             config = ProfilerConfig(ranks=[])
-        if not tool_config:
-            assert not config.enable, "tool_config must be provided when profiler is enabled"
-        self.discrete: bool = tool_config.discrete if tool_config else False
+        # verl core has no `tool_config.vtune` schema entry, so `tool_config.get("vtune")`
+        # resolves to None and DistProfiler then substitutes the whole tool_config mapping
+        # (verl/utils/profiler/profile.py: `if tool_config is None: tool_config = config.tool_config`).
+        # That mapping is truthy but has no `discrete`, so read it defensively — the same way
+        # core itself does. `discrete` is a no-op on XPU anyway, so False is always correct.
+        self.discrete: bool = getattr(tool_config, "discrete", False)
 
     def start(self, **kwargs):
         if not self.discrete:
