@@ -71,8 +71,13 @@ def _patch_get_torch_profiler():
         # TypeError'ing on every other platform that hits a newer call site.
         if not contents or "mlu" not in contents:
             return _original_get_torch_profiler(
-                contents=contents, save_path=save_path, role=role,
-                save_file_prefix=save_file_prefix, rank=rank, schedule=schedule, **kwargs,
+                contents=contents,
+                save_path=save_path,
+                role=role,
+                save_file_prefix=save_file_prefix,
+                rank=rank,
+                schedule=schedule,
+                **kwargs,
             )
         save_dir = os.path.join(save_path, role) if role else save_path
         os.makedirs(save_dir, exist_ok=True)
