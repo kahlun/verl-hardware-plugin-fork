@@ -71,7 +71,7 @@ def mark_annotate(
 def marked_timer(
     name: str,
     timing_raw: dict[str, float],
-    color: str = None,
+    color: Optional[str] = None,
     domain: Optional[str] = None,
     category: Optional[str] = None,
 ):
@@ -101,7 +101,7 @@ class VtuneProfiler(DistProfiler):
             config = ProfilerConfig(ranks=[])
         if not tool_config:
             assert not config.enable, "tool_config must be provided when profiler is enabled"
-        self.discrete: bool = tool_config.discrete
+        self.discrete: bool = tool_config.discrete if tool_config else False
 
     def start(self, **kwargs):
         if not self.discrete:
