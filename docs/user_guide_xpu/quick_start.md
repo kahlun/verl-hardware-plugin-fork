@@ -15,13 +15,37 @@ Current software and hardware scope:
   - Intel Arc Pro B70 (2x GPU, 32 GB each)
   - Multi-node — not yet tested
 
-## Prepare Data
+## 1. Verify Platform Resolution
+
+```bash
+python3 -c '
+from verl.plugin.platform import get_platform
+p = get_platform()
+print("device:  ", p.device_name)
+print("vendor:  ", p.vendor_name)
+print("backend: ", p.communication_backend_name())
+print("ray res: ", p.ray_resource_name())
+print("ipc:     ", p.is_ipc_supported())
+'
+```
+
+Expected output:
+
+```text
+device:   xpu
+vendor:   intel
+backend:  xccl
+ray res:  GPU
+ipc:      False
+```
+
+## 2. Prepare Data
 
 ```bash
 python3 examples/data_preprocess/gsm8k.py --local_save_dir ~/data/gsm8k
 ```
 
-## Launch Training
+## 3. Launch Training
 
 ```bash
 export ZE_AFFINITY_MASK=0,1            # select physical device indices
@@ -67,6 +91,15 @@ throughput):
 timing_s/step: ~93   perf/throughput: ~41 tok/s
 ```
 
+## 4. Run the Plugin Test Suite
+
+```bash
+pytest tests/test_plugin_registration.py -k xpu -v
+```
+
+Expected: all XPU cases pass. These run on any host, with or without an
+Intel GPU attached.
+
 ## Feature Support Matrix
 
 | Category | Status | Notes |
@@ -78,6 +111,9 @@ timing_s/step: ~93   perf/throughput: ~41 tok/s
 | Hardware (1-GPU) | Validated | Arc Pro B60: 51.2 s/step, 148.2 tok/s (batch 16, Qwen2.5-0.5B) |
 | Hardware (2-GPU) | Validated | Arc Pro B60 x2: 93.0 s/step at same batch size |
 | Multi-node | Not yet tested | — |
+| Profiler | Intel VTune (ITT) | Set `profiler.tool: vtune`; requires verl-core with [verl#7917](https://github.com/verl-project/verl/pull/7917) (see install_guidance.md) |
+
+## Next Steps
 
 See [`docker/intel_gpu/README.md`](../../docker/intel_gpu/README.md) for a
 containerized environment with all of the above preconfigured.

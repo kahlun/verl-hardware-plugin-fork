@@ -5,13 +5,40 @@ Intel XPU support ships as this external plugin package
 [`verl/plugin/platform/README.md`](https://github.com/verl-project/verl/blob/main/verl/plugin/platform/README.md)
 in verl-core for the plugin pattern this follows.
 
-## Bare Metal / Existing Environment
+## Prerequisites
+
+- PyTorch with XPU support (`torch.xpu.is_available() == True`)
+- vLLM built from source with `VLLM_TARGET_DEVICE=xpu` (vLLM's `pip` wheels
+  do not ship XPU kernels)
+- oneCCL runtime for the `xccl` distributed backend
+
+**verl-core version note:** the `is_reduce_avg_supported()`,
+`attention_utils_module()`, `profiler_markers()`, and `dist_profiler_cls()`
+hooks this plugin implements only exist on verl-core builds that include
+[verl-project/verl#7917](https://github.com/verl-project/verl/pull/7917),
+which has not merged yet. Against a `verl-project/verl:main` checkout
+without it, this plugin still installs and runs, but those four hooks
+silently no-op: the reduce_avg workaround still applies (via the redundant
+engine-level call in `fsdp_xpu.py`), but attention padding falls back to the
+generic implementation and `profiler.tool: vtune` will not resolve to a
+profiler. Use the pinned ref in [`docker/intel_gpu/`](../../docker/intel_gpu/)
+for a known-good combination until #7917 merges.
+
+## 1. Install verl and verl-hardware-plugin
 
 ```bash
-pip install -e /path/to/verl-hardware-plugin
+# Install verl (or a checkout that already includes #7917 — see note above)
+git clone https://github.com/verl-project/verl.git
+cd verl
+pip install -e .
+
+# Install verl-hardware-plugin
+git clone https://github.com/verl-project/verl-hardware-plugin.git
+cd verl-hardware-plugin
+pip install -e .
 ```
 
-That's it — no environment variable is required. The plugin is
+No environment variable is required beyond this. The plugin is
 auto-discovered by verl through the `verl.plugins` setuptools entry_points
 group declared in this repo's `pyproject.toml`
 (`[project.entry-points."verl.plugins"] hardware = "verl_hardware_plugin"`),
@@ -20,22 +47,7 @@ which verl loads by default (`VERL_USE_EXTERNAL_PLUGINS=auto`). Set
 to this plugin, or `VERL_PLATFORM=intel` to force platform selection instead
 of relying on auto-detection.
 
-Prerequisites this plugin does not install for you:
-
-- PyTorch with XPU support (`torch.xpu.is_available() == True`)
-- vLLM built from source with `VLLM_TARGET_DEVICE=xpu` (vLLM's `pip` wheels
-  do not ship XPU kernels)
-- oneCCL runtime for the `xccl` distributed backend
-
-## Docker
-
-A prebuilt image definition is at
-[`docker/intel_gpu/`](../../docker/intel_gpu/) in this repo — it clones
-verl-core at a pinned ref, builds vLLM from source for XPU, and installs this
-plugin on top. See [`docker/intel_gpu/README.md`](../../docker/intel_gpu/README.md)
-for build/run instructions and the full software stack table.
-
-## Verifying the Install
+## 2. Verify the Install
 
 ```bash
 python3 -c "
@@ -49,3 +61,17 @@ Expected on Intel GPU: `device: xpu / vendor: intel`. If it instead falls
 back to `nvidia`, the plugin was not discovered — check that `pip install`
 completed without error and that no `VERL_USE_EXTERNAL_PLUGINS=none` is set
 in the environment.
+
+## Docker
+
+A prebuilt image definition is at
+[`docker/intel_gpu/`](../../docker/intel_gpu/) in this repo — it clones
+verl-core at a pinned ref, builds vLLM from source for XPU, and installs this
+plugin on top. See [`docker/intel_gpu/README.md`](../../docker/intel_gpu/README.md)
+for build/run instructions and the full software stack table. This is the
+fastest way to get a known-good verl-core + plugin combination, since it
+sidesteps the verl-core version note above.
+
+## Next Steps
+
+Follow the [Quick Start](./quick_start.md).
