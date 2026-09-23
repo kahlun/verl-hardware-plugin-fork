@@ -187,6 +187,22 @@ class PlatformXPU(PlatformBase):
         return ["RAY_EXPERIMENTAL_NOSET_ZE_AFFINITY_MASK"]
 
     # ------------------------------------------------------------------
+    # NUMA affinity (pynvml equivalent gap — see companion core PR)
+    # ------------------------------------------------------------------
+
+    def set_numa_affinity(self, local_rank: int) -> None:
+        """Pin the calling process to the CPU cores local to this GPU.
+
+        Not yet implemented. Design: zesDevicePciGetProperties(handle) -> PCI
+        BDF -> /sys/bus/pci/devices/<bdf>/numa_node -> sysfs cpulist ->
+        os.sched_setaffinity. Verified feasible on real 2-node x 2-GPU
+        hardware; see the core-side design doc for the full writeup and
+        evidence. Tracked together with the verl-core PR that adds the
+        get_platform().set_numa_affinity() call site.
+        """
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
     # IPC support
     # ------------------------------------------------------------------
 
