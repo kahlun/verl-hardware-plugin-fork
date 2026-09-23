@@ -32,11 +32,7 @@ verl core discovers without needing to know about ITT or XPU itself.
 
 ## Enabling VTune
 
-There is no dedicated `tool_config.vtune` schema entry in verl-core's generated
-config yet (only `nsys`/`npu`/`torch`/`torch_memory`/`precision_debugger` have
-one) — `VtuneProfiler` reuses `NsightToolConfig`'s shape (it only reads
-`tool_config.discrete`), so add it with Hydra's `+` (this exact recipe has been
-verified end-to-end against a live Hydra compose, not just read from source):
+Selecting the tool is all that is required:
 
 ```bash
 python -m verl.trainer.main_ppo \
@@ -44,14 +40,25 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.profiler.tool=vtune \
   actor_rollout_ref.actor.profiler.enable=True \
   actor_rollout_ref.actor.profiler.all_ranks=False \
-  actor_rollout_ref.actor.profiler.ranks=[0] \
+  actor_rollout_ref.actor.profiler.ranks=[0]
+```
+
+There is no dedicated `tool_config.vtune` schema entry in verl-core's generated
+config (only `nsys`/`npu`/`torch`/`torch_memory`/`precision_debugger` have one),
+and `vtune` does not need one: the only field `VtuneProfiler` reads is
+`tool_config.discrete`, which has no effect on XPU because
+`PlatformXPU.profiler_start`/`profiler_stop` are no-ops. It therefore defaults to
+`False` and no `+tool_config.vtune.*` override is needed.
+
+If you want the config to carry an explicit entry anyway, add it with Hydra's `+`
+— `VtuneProfiler` reuses `NsightToolConfig`'s shape:
+
+```bash
   +actor_rollout_ref.actor.profiler.tool_config.vtune._target_=verl.utils.profiler.config.NsightToolConfig \
   +actor_rollout_ref.actor.profiler.tool_config.vtune.discrete=False
 ```
 
-Omitting the `tool_config.vtune` block entirely raises
-`AssertionError: tool_config must be provided when profiler is enabled` from
-`VtuneProfiler.__init__` — this is intentional, not a bug to work around.
+This changes nothing functionally on XPU.
 
 ## How this differs from Nsight/torch/NPU profiling
 
@@ -79,9 +86,6 @@ what gets recorded) — the ITT ranges are emitted the same way either way.
 
 ## Troubleshooting
 
-- `AssertionError: tool_config must be provided when profiler is enabled` — add
-  the `+actor_rollout_ref.actor.profiler.tool_config.vtune.*` overrides shown
-  above; this profiler has no config-group default the way `nsys`/`npu`/`torch` do.
 - If `profiler.tool=vtune` appears to do nothing, confirm the running verl-core
   build actually includes #7917 (see Prerequisites) — against stock `main` this
   is a silent no-op, not an error.
