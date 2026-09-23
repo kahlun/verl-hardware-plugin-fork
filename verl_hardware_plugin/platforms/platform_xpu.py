@@ -64,6 +64,71 @@ def _ensure_torch_xpu() -> bool:
         return False
 
 
+def _zes_device_pci_bdf(local_rank: int) -> str:
+    """Return the PCI BDF (``domain:bus:device.function``) of GPU ``local_rank``.
+
+    Enumerates via pyzes (Level Zero Sysman), respecting whatever device
+    visibility mask (e.g. cgroup GPU limits) is already in effect for this
+    process -- verified on real hardware to enumerate exactly the allocated
+    GPU count, not the host's full GPU count.
+    """
+    import pyzes as pz
+    from ctypes import byref, c_uint32
+
+    os.environ.setdefault("ZES_ENABLE_SYSMAN", "1")
+    pz.zesInit(0)
+
+    driver_count = c_uint32(0)
+    pz.zesDriverGet(byref(driver_count), None)
+    drivers = (pz.zes_driver_handle_t * driver_count.value)()
+    pz.zesDriverGet(byref(driver_count), drivers)
+
+    devices = []
+    for drv in drivers:
+        dev_count = c_uint32(0)
+        pz.zesDeviceGet(drv, byref(dev_count), None)
+        devs = (pz.zes_device_handle_t * dev_count.value)()
+        pz.zesDeviceGet(drv, byref(dev_count), devs)
+        devices.extend(list(devs))
+
+    if local_rank >= len(devices):
+        raise RuntimeError(f"local_rank {local_rank} out of range for {len(devices)} zes-visible device(s)")
+
+    props = pz.zes_pci_properties_t()
+    pz.zesDevicePciGetProperties(devices[local_rank], byref(props))
+    addr = props.address
+    return f"{addr.domain:04x}:{addr.bus:02x}:{addr.device:02x}.{addr.function:x}"
+
+
+def _read_int(path: str) -> Optional[int]:
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return int(f.read().strip())
+
+
+def _read_text(path: str) -> Optional[str]:
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return f.read().strip()
+
+
+def _parse_cpulist(cpulist: str) -> set:
+    """Parse a Linux sysfs cpulist (e.g. ``"0-3,8,10-11"``) into a set of CPU ids."""
+    cpus: set = set()
+    for part in cpulist.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-")
+            cpus.update(range(int(start), int(end) + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
+
+
 @PlatformRegistry.register(platform="intel")
 class PlatformXPU(PlatformBase):
     """Platform backend for Intel XPU (Data Center GPU Max, Arc, etc.).
@@ -191,16 +256,38 @@ class PlatformXPU(PlatformBase):
     # ------------------------------------------------------------------
 
     def set_numa_affinity(self, local_rank: int) -> None:
-        """Pin the calling process to the CPU cores local to this GPU.
+        """Pin the calling process to the CPU cores local to device ``local_rank``.
 
-        Not yet implemented. Design: zesDevicePciGetProperties(handle) -> PCI
-        BDF -> /sys/bus/pci/devices/<bdf>/numa_node -> sysfs cpulist ->
-        os.sched_setaffinity. Verified feasible on real 2-node x 2-GPU
-        hardware; see the core-side design doc for the full writeup and
-        evidence. Tracked together with the verl-core PR that adds the
-        get_platform().set_numa_affinity() call site.
+        No CPU-affinity equivalent exists in torch.xpu/pyzes (pyzes only
+        covers telemetry: temperature/power/clock/utilization/memory). Built
+        from the same primitives NVML uses internally on Linux:
+        zesDevicePciGetProperties -> PCI BDF -> sysfs numa_node -> sysfs
+        cpulist -> os.sched_setaffinity. Verified on real 2-node x 2-GPU
+        hardware, including a case where a single pod's two GPUs sat on two
+        different NUMA nodes (see the core-side design doc for the full
+        writeup and probe output) -- which is why this is keyed per device
+        index rather than pinning "the pod" to one NUMA node.
+
+        Failure to pin (no pyzes, no NUMA topology on this box, etc.) is a
+        warning, not an exception -- this is a performance optimization,
+        not a correctness requirement, matching the base class's contract.
         """
-        raise NotImplementedError
+        try:
+            bdf = _zes_device_pci_bdf(local_rank)
+            numa_node = _read_int(f"/sys/bus/pci/devices/{bdf}/numa_node")
+            if numa_node is None or numa_node < 0:
+                logger.info("[verl_hardware_plugin] No NUMA topology for device %d (%s); skipping affinity pinning", local_rank, bdf)
+                return
+            cpulist = _read_text(f"/sys/devices/system/node/node{numa_node}/cpulist")
+            if not cpulist:
+                logger.warning("[verl_hardware_plugin] numa_node=%d for device %d (%s) but no cpulist found", numa_node, local_rank, bdf)
+                return
+            os.sched_setaffinity(0, _parse_cpulist(cpulist))
+            logger.info("[verl_hardware_plugin] Pinned rank to NUMA node %d (device %d, %s, cpus=%s)", numa_node, local_rank, bdf, cpulist)
+        except ImportError:
+            logger.warning("[verl_hardware_plugin] pyzes not available, skipping NUMA affinity setup")
+        except Exception as e:  # noqa: BLE001 - best-effort optimization, never fatal
+            logger.warning("[verl_hardware_plugin] Failed to set NUMA affinity: %s", e)
 
     # ------------------------------------------------------------------
     # IPC support
