@@ -46,7 +46,7 @@
 # with no sourcing required. The torch 2.13.0+xpu wheel also bundles its own
 # oneCCL, but the base's 2022.1.0 takes precedence via LD_LIBRARY_PATH and is
 # the one torch-xpu-ops links against at wheel-build time — so they match.
-FROM intel/deep-learning-essentials:2026.1.0-devel-ubuntu24.04
+FROM intel/deep-learning-essentials:2026.1.0-devel-ubuntu24.04@sha256:6d0c782487d1f5d6e7d6772523cc2c3928d0aaa2213dbe88ad54733657c82332
 
 LABEL org.opencontainers.image.title="verl-intel-gpu"
 LABEL org.opencontainers.image.description="verl + verl-hardware-plugin development image for Intel GPU"
@@ -55,11 +55,19 @@ LABEL org.opencontainers.image.vendor="verl-hardware-plugin"
 ARG DEBIAN_FRONTEND=noninteractive
 ARG PYTHON_VERSION=3.12
 
-# vLLM pinned to the v0.29.0 release tag — the first stable release that carries
-# the XPU torch==2.13.0 + vllm_xpu_kernels 0.1.14.1 pairing. requirements/xpu.txt at
-# v0.29.0 is byte-identical to the previously-pinned commit 5b29c958 (which is
-# v0.29.0rc1~173, i.e. an ancestor of this tag), so the torch/oneCCL/driver stack
-# below is unchanged — this just swaps the commit pin for the stable tag.
+# vLLM stays pinned to v0.29.0 — the last version confirmed end-to-end on real
+# B60 hardware (real GRPO training step, throughput 53.4-56.3). v0.30.0 was
+# evaluated (installs cleanly, same torch==2.13.0 + vllm_xpu_kernels==0.1.14.1
+# pairing) but a live GRPO run on it hit a reproducible crash during
+# rollout weight-sync (AutoWeightsLoader tied-embedding check tripped when
+# lm_head.weight/model.embed_tokens.weight landed in different buckets) that
+# v0.29.0 does not hit; root cause not yet isolated from a verl-core checkout
+# confound, so holding at v0.29.0 until that's resolved.
+#
+# Still installed from the prebuilt XPU wheel (see Layer 1) instead of built
+# from source, though — that swap is orthogonal to the version pin and cuts
+# the image build down by the CMake/SYCL compile step regardless of which
+# vLLM version is selected.
 ARG VLLM_VERSION=v0.29.0
 
 # torch version is intentionally not pinned here. vLLM's requirements/xpu.txt
@@ -151,24 +159,28 @@ ENV UV_LINK_MODE="copy"
 ENV VLLM_TARGET_DEVICE="xpu"
 
 # --- Layer 1: vLLM + torch Intel GPU ---
-# vLLM is fetched at the pinned release tag (${VLLM_VERSION}), which carries:
-#   - torch==2.13.0 + vllm_xpu_kernels 0.1.12 in requirements/xpu.txt
-#   - XPU sleep-mode (device_allocator/xpumem.py + xpumem kernels wiring)
-# We fetch the tag with its history so setuptools-scm resolves the version from
-# the annotated tag directly (SETUPTOOLS_SCM_PRETEND_VERSION derives it from the
-# tag name as a backstop for the shallow --depth 1 fetch).
+# Installed from the prebuilt XPU wheel at wheels.vllm.ai/<version>/xpu instead
+# of built from source — that index carries torch==2.13.0 + vllm_xpu_kernels
+# 0.1.14.1 (see ARG VLLM_VERSION above), same as a from-source build.
+#
+# The unversioned wheels.vllm.ai/xpu "triton shim" index is included alongside
+# the version-scoped one defensively: at v0.29.0 the version-scoped index
+# happens to already carry the exact triton==3.7.2+xpu that requirements/xpu.txt
+# pins, but that's not guaranteed for every release — v0.30.0's version-scoped
+# index republishes only that commit's *latest* triton-xpu build
+# (triton-3.8.0+xpu), not the older pinned version, and resolution fails
+# outright without the shim index to fall back on. Keep both.
+#
+# --extra-index-url on this command line REPLACES UV_EXTRA_INDEX_URL (set above
+# to ${PIP_EXTRA_INDEX_URL}) rather than adding to it, so PyPI has to be repeated
+# explicitly here too — otherwise plain-PyPI transitive deps pulled in via
+# common.txt (e.g. lm-format-enforcer) become unresolvable.
 RUN set -ex && \
-    git init /opt/vllm && \
-    cd /opt/vllm && \
-    git remote add origin https://github.com/vllm-project/vllm.git && \
-    git fetch --depth 1 origin tag "${VLLM_VERSION}" && \
-    git checkout "${VLLM_VERSION}" && \
-    SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION#v}" \
-    uv pip install --upgrade pip setuptools wheel && \
-    SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION#v}" \
-    uv pip install -r requirements/xpu.txt && \
-    SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_VERSION#v}" \
-    uv pip install --no-build-isolation .
+    uv pip install "vllm==${VLLM_VERSION#v}+xpu" \
+        --extra-index-url "https://wheels.vllm.ai/${VLLM_VERSION#v}/xpu" \
+        --extra-index-url "https://wheels.vllm.ai/xpu" \
+        --extra-index-url "${PIP_EXTRA_INDEX_URL}" \
+        --index-strategy unsafe-best-match
 
 # --- Layer 2: verl core, cloned at a pinned ref (see VERL_GIT_REPO/VERL_REF above) ---
 RUN set -eux && \
