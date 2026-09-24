@@ -97,10 +97,30 @@ def _zes_device_pci_bdf(local_rank: int) -> str:
     visibility mask (e.g. cgroup GPU limits) is already in effect for this
     process -- verified on real hardware to enumerate exactly the allocated
     GPU count, not the host's full GPU count.
+
+    Requires pyzes >= 0.1.2. The whole PCI family (``zesDevicePciGetProperties``,
+    ``zes_pci_properties_t``, ``zes_pci_address_t``) was added by
+    oneapi-src/level-zero#462 and first released in 0.1.2 (2026-06-12); 0.1.1
+    has no PCI API at all. Checked explicitly because the bare failure is an
+    unhelpful ``AttributeError: module 'pyzes' has no attribute
+    'zes_pci_properties_t'`` -- observed on real hardware against an image that
+    shipped 0.1.1.
     """
     from ctypes import byref, c_uint32
 
     import pyzes as pz
+
+    if not hasattr(pz, "zesDevicePciGetProperties"):
+        try:
+            from importlib.metadata import version
+
+            installed = version("pyzes")
+        except Exception:  # noqa: BLE001 - only used to improve the message
+            installed = "unknown"
+        raise RuntimeError(
+            f"pyzes {installed} has no PCI API (zesDevicePciGetProperties was added in 0.1.2); "
+            "NUMA affinity needs pyzes>=0.1.2"
+        )
 
     os.environ.setdefault("ZES_ENABLE_SYSMAN", "1")
     pz.zesInit(0)

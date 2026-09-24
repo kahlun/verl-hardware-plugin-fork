@@ -110,31 +110,76 @@ degrades to a working patch instead of a silent no-op.
 
 ## Not yet done
 
-- No hardware validation — this was built and reasoned through against
-  `verl-core`'s real `main` source (via GitHub, not a live checkout), not
-  run on a B60. Treat the "clean" verdicts above as "verified against
-  source," not "verified end-to-end."
+- No hardware validation for the four #7917-related capabilities — those were
+  built and reasoned through against `verl-core`'s real `main` source (via
+  GitHub, not a live checkout), not run on a B60. Treat their "clean" verdicts
+  above as "verified against source," not "verified end-to-end."
 - Unit tests cover `numa_affinity_patch_xpu` only
-  (`tests/test_numa_affinity_patch_xpu.py`, 22 cases, passing — verl and pyzes
+  (`tests/test_numa_affinity_patch_xpu.py`, 24 cases, passing — verl and pyzes
   are both stubbed so it runs on a CPU-only host). `attention_patch_xpu`,
   `dist_profiler_patch_xpu` and `reduce_avg_allreduce_patch_xpu` still have
   none.
-- `set_numa_affinity` is a partial exception: the *pyzes mechanism* it calls
-  (`zesDevicePciGetProperties` → BDF → sysfs → `sched_setaffinity`) was
-  verified on real 2-node × 2-GPU B60 hardware, including the case where one
-  pod's two GPUs sat on two different NUMA nodes:
-  ```
-  rank=0 bdf=0000:3d:00.0 numa_node=0 cpulist=0-127,256-383   PINNED_OK=True
-  rank=1 bdf=0000:ba:00.0 numa_node=1 cpulist=128-255,384-511 PINNED_OK=True
-  ```
-  What is *not* yet verified is the monkeypatch wiring around it — that the
-  patch is installed and the patched function actually runs inside a real
-  verl worker.
-- Watch item for that run: under Ray, `_resolve_local_rank()` returns the
+- `set_numa_affinity` is the exception — it **is** hardware-verified. See the
+  section below.
+- Watch item for a multi-GPU/Ray run: `_resolve_local_rank()` returns the
   global device id Ray assigned, while pyzes enumerates only the devices
   visible to the process. Those agree when
   `RAY_EXPERIMENTAL_NOSET_ZE_AFFINITY_MASK` is set and can disagree when Ray
   sets `ZE_AFFINITY_MASK` per worker. The pynvml path this replaces has the
   identical property, so it isn't a regression introduced here — but a log
   line reading `out of range for N zes-visible device(s)` is this, and it
-  would mean the same latent issue exists on CUDA today.
+  would mean the same latent issue exists on CUDA today. The verification run
+  below had `ZE_AFFINITY_MASK` unset, so it did not exercise the disagreeing
+  case.
+
+## Hardware verification: `set_numa_affinity` (2026-09-24)
+
+Run via `devctl test --gpu=2 --gpu-model=B60` on image
+`verl-intel-gpu:pr8-monkeypatch-20260924`, with this branch's
+`verl_hardware_plugin` overlaid onto the image's editable install
+(`scripts/devctl_verify_numa.sh` → `scripts/verify_numa_patch_xpu.py`).
+6/6 checks passed, exit 0:
+
+```
+set_numa_affinity -> verl_hardware_plugin.patches.numa_affinity_patch_xpu.apply.<locals>._patched_set_numa_affinity
+[PASS] verl.utils.distributed.set_numa_affinity is patched
+[PASS] verl selected the XPU platform            device_name='xpu' vendor='intel'
+[PASS] engine_workers' from-imported binding is the patched function
+  local_rank=0 bdf=0000:3d:00.0 numa_node=0 cpulist=0-127,256-383
+[PASS] resolved PCI BDF via pyzes
+[PASS] affinity pinning changed this process's cpuset    512 cpus -> 256 cpus
+```
+
+Three things this establishes that source review could not:
+
+1. The patch really is installed inside a real verl process, with **zero**
+   verl-core changes — the plugin was loaded through its normal
+   `verl.plugins` entry point, nothing else.
+2. The import-order argument holds *live*: `verl.workers.engine_workers`'s
+   own from-imported binding is the patched function, not the original
+   pynvml one. This is the claim the whole approach rests on, and it is the
+   one that a silent no-op would have hidden.
+3. Pinning actually happens: the process's cpuset went from all 512 logical
+   CPUs to the 256 local to the GPU's NUMA node. Before this patch, that
+   call was a no-op on XPU.
+
+### Found by this run: pyzes 0.1.1 has no PCI API
+
+The first attempt failed with
+`AttributeError: module 'pyzes' has no attribute 'zes_pci_properties_t'`.
+The image ships **pyzes 0.1.1**, which contains *no* PCI symbols at all —
+`zesDevicePciGetProperties`, `zes_pci_properties_t` and `zes_pci_address_t`
+were all added by oneapi-src/level-zero#462 and first released in **0.1.2**
+(2026-06-12). Confirmed by diffing `dir(pyzes)` across both versions.
+
+This is a latent defect in the implementation inherited from
+`verl-hardware-plugin-fork#9`, and it applies to the `PlatformBase`-hook
+version of this code equally: the failure surfaces as an unhelpful
+`AttributeError`, swallowed into a warning, leaving the run silently
+un-pinned. `_zes_device_pci_bdf()` now checks for the symbol up front and
+raises a message naming the required version instead.
+
+Consequence for the image: `pyzes>=0.1.2` needs to land in
+`docker/intel_gpu/requirements-intel-gpu.txt` (the `feature/xpu-docker`
+branch). That file currently pins neither pyzes nor pynvml — the image gets
+0.1.1 transitively.

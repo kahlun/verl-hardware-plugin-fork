@@ -124,7 +124,10 @@ def load_patch(monkeypatch):
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, spec.name, module)
         spec.loader.exec_module(module)
-        # Never touch real pyzes or real sysfs from a unit test.
+        # Never touch real pyzes or real sysfs from a unit test. The real
+        # implementation stays reachable for the tests that need to assert it
+        # swallows its own failures.
+        module._real_set_numa_affinity_xpu = module._set_numa_affinity_xpu
         monkeypatch.setattr(module, "_set_numa_affinity_xpu", lambda rank: recorder.pinned_ranks.append(rank))
         return module
 
@@ -270,6 +273,36 @@ def test_parse_cpulist_matches_real_hardware_output(stub_verl, load_patch):
     assert len(cpus) == 256
     assert min(cpus) == 128
     assert max(cpus) == 511
+
+
+def test_old_pyzes_raises_actionable_error(stub_verl, load_patch, monkeypatch):
+    """pyzes 0.1.1 has no PCI API at all; the message must say so.
+
+    Observed for real on a B60 run against an image shipping 0.1.1, where the
+    bare failure was `AttributeError: module 'pyzes' has no attribute
+    'zes_pci_properties_t'` -- true but useless.
+    """
+    _, recorder = stub_verl()
+    patch = load_patch(recorder)
+
+    old_pyzes = ModuleType("pyzes")  # 0.1.1: zesInit etc. exist, no PCI family
+    old_pyzes.zesInit = lambda flags: None
+    monkeypatch.setitem(sys.modules, "pyzes", old_pyzes)
+
+    with pytest.raises(RuntimeError, match=r"pyzes>=0\.1\.2"):
+        patch._zes_device_pci_bdf(0)
+
+
+def test_old_pyzes_is_reported_as_warning_not_crash(stub_verl, load_patch, monkeypatch):
+    """That RuntimeError must still be swallowed by the real pinning wrapper."""
+    _, recorder = stub_verl()
+    patch = load_patch(recorder)
+
+    old_pyzes = ModuleType("pyzes")
+    old_pyzes.zesInit = lambda flags: None
+    monkeypatch.setitem(sys.modules, "pyzes", old_pyzes)
+
+    patch._real_set_numa_affinity_xpu(0)  # the unmocked one; must not raise
 
 
 def test_read_helpers_return_none_for_missing_paths(stub_verl, load_patch, tmp_path):
