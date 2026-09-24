@@ -75,8 +75,19 @@ def apply() -> None:
 
     original_all_reduce = dist.all_reduce
 
+    def _group_uses_xccl(group) -> bool:
+        # verl always initializes process groups with a hybrid backend string
+        # (verl/utils/distributed.py: f"cpu:gloo,{device}:{nccl_backend}"), so
+        # dist.get_backend(group) returns e.g. "cpu:gloo,xpu:xccl", never the
+        # bare "xccl" -- an exact-equality check against "xccl" is always False
+        # for every real verl process group and silently no-ops this patch.
+        backend = dist.get_backend(group)
+        if backend == "xccl":
+            return True
+        return any(segment.rsplit(":", 1)[-1] == "xccl" for segment in backend.split(","))
+
     def _patched_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
-        if op != dist.ReduceOp.AVG or async_op or dist.get_backend(group) != "xccl":
+        if op != dist.ReduceOp.AVG or async_op or not _group_uses_xccl(group):
             return original_all_reduce(tensor, op=op, group=group, async_op=async_op)
 
         world_size = dist.get_world_size(group=group)
