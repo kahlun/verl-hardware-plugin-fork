@@ -24,10 +24,12 @@ Failure handling
     exactly the kind of thing that later surfaces as a wrong number or an
     unexplained collective hang -- so those are never swallowed:
 
-    - REQUIRED patches guard numerical correctness (xccl cannot execute
-      ReduceOp.AVG at all; rmpad attention needs the XPU function set). If one
-      of these cannot be installed, training would produce wrong results or
-      crash far from the cause, so apply_all() re-raises as RuntimeError.
+    - REQUIRED patches guard numerical correctness (oneCCL's ReduceOp.AVG is
+      not reliably available -- see reduce_avg_allreduce_patch_xpu's docstring
+      for why "not reliably" rather than "not at all"; rmpad attention needs
+      the XPU function set). If one of these cannot be installed, training
+      would produce wrong results or abort far from the cause, so apply_all()
+      re-raises as RuntimeError.
     - Non-required patches are feature wiring (`profiler.tool: vtune`
       selection). Losing one degrades observability but not correctness, so it
       is reported with logger.exception and training continues.
@@ -72,8 +74,8 @@ def apply_all() -> None:
             elif required:
                 raise RuntimeError(
                     f"{qualname}.apply() failed on an Intel XPU host. This patch is required for correct "
-                    f"results (xccl has no ReduceOp.AVG / rmpad attention needs the XPU function set); "
-                    f"continuing would silently produce wrong numbers."
+                    f"results (oneCCL's ReduceOp.AVG is not reliably available / rmpad attention needs the "
+                    f"XPU function set); continuing would silently produce wrong numbers."
                 ) from e
             else:
                 logger.exception(

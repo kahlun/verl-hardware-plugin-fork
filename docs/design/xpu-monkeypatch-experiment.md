@@ -78,17 +78,45 @@ another vendor's host changes *that* vendor's behavior.
 
 | Patch | On failure, on an XPU host |
 |---|---|
-| `reduce_avg_allreduce_patch_xpu` | **raise** — xccl cannot execute `ReduceOp.AVG`; continuing produces wrong gradients with no error |
+| `reduce_avg_allreduce_patch_xpu` | **raise** — oneCCL's `ReduceOp.AVG` is not reliably available; continuing risks a mid-collective abort or wrong gradients |
 | `attention_patch_xpu` | **raise** — rmpad attention needs the XPU function set |
 | `dist_profiler_patch_xpu` | `logger.exception`, continue — losing `tool: vtune` costs observability, not correctness |
 
 On a non-XPU host nothing was going to install anyway, so a failure is
 debug-logged and never raised.
 
+## Hardware validation
+
+Run on 2×B60 (Intel Arc Pro B60 Graphics) via devctl, 2026-09-24, inside the
+image built by PR #2's `docker/intel_gpu/Dockerfile.intel_gpu` with this
+branch as the build context (verl-core `cbf4f31b`, torch `2.13.0+xpu`, vLLM
+`0.29.0`):
+
+- 85 unit tests pass in-image.
+- All three patches install on an XPU host; none install in the same image on
+  a CPU-only container (`dist.all_reduce` and `DistProfiler.__init__` verified
+  untouched there).
+- `attention_utils._get_attention_functions()` returns the
+  `verl.utils.npu_flash_attn_utils` set; `profiler.tool: vtune` resolves to
+  `VtuneProfiler`.
+- 2-rank xccl: patched `all_reduce(AVG)` returns the true mean (1.5 for ranks
+  contributing 1 and 2), `SUM` is unaffected.
+- PR #8's premise holds on this image: verl-core `cbf4f31b` *does* define
+  `attention_utils_module`/`profiler_markers`/`dist_profiler_cls` on
+  `PlatformBase`, and this plugin overrides none of them — so the hooks are
+  inert and the patches are what produced the results above.
+
+One caveat worth recording, since it is easy to misread: a plugin-free
+baseline on the same pod showed unpatched xccl computing `ReduceOp.AVG`
+*correctly* (both sync and async) for a small 2-rank tensor. That does not
+contradict the patch — oneCCL implements AVG on its SYCL-kernel path and not
+its scheduler path, and path selection is internal, so a small collective can
+land on the working path. It does mean a 2-rank smoke test cannot demonstrate
+the failure the patch prevents.
+
 ## Not yet done
 
-- Hardware validation status: see the PR's test-plan checklist. The "clean"
-  verdicts above were reasoned against `verl-core`'s real `main` source; read
-  them as "verified against source" until a B60 run is recorded there.
+- No end-to-end GRPO training run on this branch; the validation above
+  exercises the patches directly, not a full trainer loop.
 - No unit tests yet for the two capabilities this branch deliberately does
   *not* patch (they are argued from source, not exercised).
