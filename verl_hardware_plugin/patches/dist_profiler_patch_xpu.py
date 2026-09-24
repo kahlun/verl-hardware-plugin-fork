@@ -41,6 +41,8 @@ in verl-core emitting ITT ranges too.
 import logging
 import os
 
+from ._xpu_guard import xpu_available
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -50,6 +52,11 @@ _applied = False
 def apply() -> None:
     global _applied
     if _applied:
+        return
+    # DistProfiler is a process-wide shared class object, so patching it on a
+    # CPU/CUDA/NPU process would reroute *that* platform's `tool: vtune` to the
+    # Intel ITT implementation. Same guard as every other patch in this package.
+    if not xpu_available():
         return
 
     from verl.utils.profiler.profile import DistProfiler, _NoOpProfiler

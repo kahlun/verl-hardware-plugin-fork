@@ -18,21 +18,19 @@ Dispatch shape that makes this safe (verl/utils/attention_utils.py):
 import logging
 import os
 
+from ._xpu_guard import xpu_available
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _applied = False
 
 
-def _xpu_available() -> bool:
-    import torch
-
-    return hasattr(torch, "xpu") and torch.xpu.is_available()
-
-
 def apply() -> None:
     global _applied
     if _applied:
+        return
+    if not xpu_available():
         return
 
     import verl.utils.attention_utils as attention_utils
@@ -40,7 +38,7 @@ def apply() -> None:
     original_get_attention_functions = attention_utils._get_attention_functions
 
     def _patched_get_attention_functions():
-        if _xpu_available():
+        if xpu_available():
             from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, rearrange, unpad_input
 
             attention_utils._index_first_axis = index_first_axis

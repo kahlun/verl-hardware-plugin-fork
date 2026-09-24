@@ -77,12 +77,19 @@ def marked_timer(
 
     Measures execution time, accumulates into timing_raw, and emits an ITT range
     visible in VTune when the process runs under a collector.
+
+    The range is popped in a ``finally`` so a raising body cannot leave it open.
+    (verl-core's nvtx equivalent does not do this; an exception there leaks an
+    NVTX range and every later range on the thread nests inside it, which makes
+    the resulting trace unreadable exactly when you most want to read it.)
     """
     mark_range = mark_start_range(message=name)
     from verl.utils.profiler.performance import _timer
 
-    yield from _timer(name, timing_raw)
-    mark_end_range(mark_range)
+    try:
+        yield from _timer(name, timing_raw)
+    finally:
+        mark_end_range(mark_range)
 
 
 class VtuneProfiler(DistProfiler):
@@ -136,13 +143,14 @@ class VtuneProfiler(DistProfiler):
                     get_platform().profiler_start()
                 mark_range = mark_start_range(message=profile_name)
 
-                result = func(*args, **kwargs_inner)
-
-                mark_end_range(mark_range)
-                if self.discrete:
-                    get_platform().profiler_stop()
-
-                return result
+                try:
+                    return func(*args, **kwargs_inner)
+                finally:
+                    # Pop the range even if func raised, or every later range on
+                    # this thread nests inside the leaked one.
+                    mark_end_range(mark_range)
+                    if self.discrete:
+                        get_platform().profiler_stop()
 
             return wrapper
 
