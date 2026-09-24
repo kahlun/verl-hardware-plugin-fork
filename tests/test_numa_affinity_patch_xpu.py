@@ -12,11 +12,12 @@ so these tests reconstruct that dispatch shape rather than exercising pyzes:
 
 verl itself is stubbed and the patch module is loaded by file path, so this
 runs on a CPU-only host with neither verl nor pyzes installed. The pyzes ->
-sysfs -> sched_setaffinity mechanism is verified on real hardware instead (see
-docs/design/xpu-monkeypatch-experiment.md); what's verified here is the wiring
+sysfs -> sched_setaffinity mechanism is verified on real hardware instead;
+what's verified here is the wiring
 around it, which hardware runs can't easily prove is *not* silently no-oping.
 """
 
+import ast
 import importlib.util
 import os
 import sys
@@ -145,7 +146,7 @@ def test_apply_replaces_core_function(stub_verl, load_patch):
 
 
 def test_importer_after_patch_gets_xpu_path(stub_verl, load_patch):
-    """The normal case: caller modules import after plugin load, so no rebinding needed."""
+    """The usual case: the caller imports after the patch lands, so no rebinding needed."""
     distributed, recorder = stub_verl(local_rank="1")
     patch = load_patch(recorder)
     patch.apply()
@@ -159,7 +160,7 @@ def test_importer_after_patch_gets_xpu_path(stub_verl, load_patch):
 
 
 def test_known_importer_before_patch_is_rebound(stub_verl, load_patch, monkeypatch):
-    """Insurance path: a call site that from-imported before the patch still works."""
+    """A call site that from-imported before PlatformXPU was constructed still gets the patch."""
     distributed, recorder = stub_verl(local_rank="2")
     patch = load_patch(recorder)
 
@@ -318,37 +319,51 @@ def test_read_helpers_return_none_for_missing_paths(stub_verl, load_patch, tmp_p
     assert patch._read_int(str(numa_node)) == -1
 
 
-def test_patch_module_is_registered_in_apply_all():
-    """Guard against adding the module but forgetting to wire it into apply_all()."""
-    source = (PATCH_PATH.parent / "__init__.py").read_text()
-
-    assert "numa_affinity_patch_xpu" in source
-    # Must appear both in the import and in the iterated tuple.
-    assert source.count("numa_affinity_patch_xpu") >= 2
-
-
-def test_applied_from_apply_all_not_platform_init():
-    """The core regression guard: this patch must NOT move into PlatformXPU.__init__.
-
-    megatron_model_merger calls set_numa_affinity() one line *before* anything
-    constructs the platform, so applying it from PlatformXPU.__init__ would
-    silently no-op there. See the patch module's docstring.
-    """
-    platform_xpu = PATCH_PATH.parents[1] / "platforms" / "platform_xpu.py"
-    source = platform_xpu.read_text() if platform_xpu.exists() else ""
-
-    assert "numa_affinity_patch_xpu" not in source, (
-        "numa_affinity_patch_xpu must be applied from patches.apply_all() at plugin-import "
-        "time, not from PlatformXPU.__init__ -- see the patch module's docstring."
-    )
+def _names_in_code(node) -> set:
+    # Names/attributes used in real code; docstrings and comments don't count.
+    found = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name):
+            found.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            found.add(n.attr)
+        elif isinstance(n, ast.alias):
+            found.add(n.name)
+    return found
 
 
-def test_plugin_init_calls_apply_all():
-    """apply_all() must actually run at plugin-import time for the ordering to hold."""
-    init = PATCH_PATH.parents[1] / "__init__.py"
-    source = init.read_text()
+def _find_def(tree, name, cls=None):
+    scope = tree
+    if cls is not None:
+        scope = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls)
+    return next((n for n in scope.body if isinstance(n, ast.FunctionDef) and n.name == name), None)
 
-    assert "apply_all" in source, "verl_hardware_plugin/__init__.py must call patches.apply_all()"
+
+def test_applied_from_platform_xpu_init():
+    """Platform-gated: only PlatformXPU construction (verl selected XPU) installs the patch."""
+    tree = ast.parse((PATCH_PATH.parents[1] / "platforms" / "platform_xpu.py").read_text())
+    init = _find_def(tree, "__init__", cls="PlatformXPU")
+
+    assert init is not None, "PlatformXPU must define __init__ that applies the patch"
+    calls = [
+        n
+        for n in ast.walk(init)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "apply"
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "numa_affinity_patch_xpu"
+    ]
+    assert calls, "PlatformXPU.__init__ must call numa_affinity_patch_xpu.apply()"
+
+
+def test_not_applied_from_shared_apply_all():
+    """Must never be wired through the shared, vendor-agnostic apply_all()."""
+    tree = ast.parse((PATCH_PATH.parent / "__init__.py").read_text())
+    apply_all = _find_def(tree, "apply_all")
+
+    assert apply_all is not None
+    assert "numa_affinity_patch_xpu" not in _names_in_code(apply_all)
 
 
 def test_no_os_environ_leak(stub_verl, load_patch):

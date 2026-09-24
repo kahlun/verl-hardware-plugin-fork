@@ -17,10 +17,14 @@ apply_all() is idempotent, so importing this package is safe even when
 another vendor's plugin (or no accelerator at all) is active in the same
 process.
 
-`numa_affinity_patch_xpu` is the one module here that *must* be applied from
-apply_all() rather than from `PlatformXPU.__init__`, because one of its two
-call sites runs before anything in that path calls `get_platform()`. It
-carries the full argument in its own docstring.
+`numa_affinity_patch_xpu` is NOT called from here. It is applied from
+`PlatformXPU.__init__` instead, once verl has actually selected XPU for this
+process -- same convention as `reduce_avg_allreduce_patch_xpu` -- so it never
+touches `verl.utils.distributed.set_numa_affinity` on a host where a
+different platform is selected. See `platform_xpu.py`'s `__init__` and
+`numa_affinity_patch_xpu`'s module docstring for the reasoning and its one
+known gap (the checkpoint-merge path, which selects a platform too late for
+any apply site to reach).
 """
 
 import logging
@@ -32,19 +36,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 def apply_all() -> None:
     """Apply every XPU monkeypatch. Safe to call multiple times or on non-XPU hosts."""
-    from . import (
-        attention_patch_xpu,
-        dist_profiler_patch_xpu,
-        numa_affinity_patch_xpu,
-        reduce_avg_allreduce_patch_xpu,
-    )
+    from . import attention_patch_xpu, dist_profiler_patch_xpu, reduce_avg_allreduce_patch_xpu
 
-    for module in (
-        attention_patch_xpu,
-        dist_profiler_patch_xpu,
-        numa_affinity_patch_xpu,
-        reduce_avg_allreduce_patch_xpu,
-    ):
+    for module in (attention_patch_xpu, dist_profiler_patch_xpu, reduce_avg_allreduce_patch_xpu):
         try:
             module.apply()
         except Exception as e:

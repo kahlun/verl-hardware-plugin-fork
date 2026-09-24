@@ -77,6 +77,31 @@ class PlatformXPU(PlatformBase):
         force_sum_reduction to work around this limitation.
     """
 
+    def __init__(self) -> None:
+        # Apply this platform's monkeypatch only now, when XPU is actually
+        # the platform verl selected for this process
+        # (verl.plugin.platform.platform_manager._create_platform() only
+        # constructs PlatformXPU() when platform detection -- explicit
+        # VERL_PLATFORM=intel or auto-detection -- picked "intel"). Applying
+        # it from the shared verl_hardware_plugin/__init__.py instead would
+        # fire on any host where XPU hardware/SDK merely happens to be
+        # present, even if a different platform ends up selected for this
+        # run -- e.g. a mixed host with VERL_PLATFORM=nvidia explicitly set
+        # would still get verl.utils.distributed.set_numa_affinity replaced
+        # for no reason.
+        #
+        # Trade-off versus that: PlatformXPU is constructed lazily, on first
+        # get_platform() call, which is *after* set_numa_affinity() already
+        # ran on the checkpoint-merge path (megatron_model_merger.py calls it
+        # one line before anything there touches the platform). This patch
+        # cannot reach that call site no matter where it is applied from --
+        # see numa_affinity_patch_xpu's module docstring for why. The
+        # training path (engine_workers.py) is unaffected: platform selection
+        # happens there before its own set_numa_affinity() call.
+        from verl_hardware_plugin.patches import numa_affinity_patch_xpu
+
+        numa_affinity_patch_xpu.apply()
+
     # ------------------------------------------------------------------
     # Core device management
     # ------------------------------------------------------------------

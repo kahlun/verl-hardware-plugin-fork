@@ -14,9 +14,8 @@ between each worker and its own GPU for the life of the job. A silent
 performance tax, not a correctness bug.
 
 There is no CPU-affinity equivalent anywhere in `torch.xpu` or `pyzes`
-(pyzes covers only telemetry: temperature/power/clock/utilization/memory --
-see the design doc for why that looks architectural rather than a version
-lag). This patch builds one from the same primitives NVML uses internally on
+(pyzes covers only telemetry: temperature/power/clock/utilization/memory).
+This patch builds one from the same primitives NVML uses internally on
 Linux:
 
     zesDevicePciGetProperties -> PCI BDF
@@ -25,9 +24,8 @@ Linux:
       -> os.sched_setaffinity
 
 Keyed per device index, not per pod: a single pod's two GPUs can sit on two
-different NUMA nodes (confirmed on real B60 hardware, see
-`docs/design/xpu-monkeypatch-experiment.md`), so pinning "the pod" to one
-NUMA node would be wrong on that box.
+different NUMA nodes (observed on a 2x B60 pod: device 0 on node 0,
+device 1 on node 1), so pinning "the pod" to one NUMA node would be wrong.
 
 Dispatch shape, and why this patch is applied where it is
 --------------------------------------------------------
@@ -41,34 +39,46 @@ both call sites bind it *by value* at their own import time:
         from verl.utils.distributed import set_numa_affinity
 
 So reassigning `verl.utils.distributed.set_numa_affinity` only takes effect
-if it happens *before* those two modules are imported. It does -- and not by
-luck. `verl/__init__.py` discovers plugin entry_points (the `_ep.load()`
-call that imports this package) after importing only `.protocol`,
-`.utils.device`, `.utils.import_utils` and `.utils.logging_utils`, none of
-which pull in `engine_workers` or `model_merger`. Since importing any
-`verl.*` submodule always executes `verl/__init__.py` first, this patch is
-guaranteed to land before either binding is created. `_rebind_importers()`
-below is insurance for the day that stops being true.
+for a given call site if it happens before that call site's own
+`set_numa_affinity()` runs -- either because the patch landed before the
+call site imported the name, or because `_rebind_importers()` below fixes
+up an already-imported module's binding before it's used.
 
-That import-order argument is also why this patch is applied from
-`apply_all()` at plugin-import time and *not* from `PlatformXPU.__init__`,
-the way `reduce_avg_allreduce_patch_xpu` is. On the checkpoint-merge path,
+`apply()` is called from `PlatformXPU.__init__`, same convention as
+`reduce_avg_allreduce_patch_xpu` -- only once verl has actually selected XPU
+for this process, so a host where a different platform is selected (e.g.
+`VERL_PLATFORM=nvidia` on a mixed box) never has this function touched at
+all. In practice `PlatformXPU` is usually constructed while verl's engine
+modules are still being imported (e.g. `verl/workers/engine/fsdp/
+transformer_impl.py` calls `get_device_name()` at module scope), so the patch
+typically lands before `engine_workers` binds the name. That ordering is an
+implementation detail of verl-core's imports, not a contract, so
+`_rebind_importers()` covers the case where `engine_workers` is imported
+first.
+
+**Known gap: the checkpoint-merge path is not covered.**
 `MegatronModelMerger.__init__` calls `set_numa_affinity()` on line 154 and
-`get_nccl_backend()` only on line 155, and `BaseModelMerger.__init__` never
-touches the platform at all -- so nothing has called `get_platform()` yet,
-`PlatformXPU` has never been constructed, and a patch applied from its
-`__init__` would never have run. It would silently no-op: the exact failure
-shape as the original bug. (The training path is safe either way, since
-`initialize_global_process_group_ray()` on line 90 goes through
-`get_device_name()`/`get_nccl_backend()` before line 92's call.)
+`get_nccl_backend()` -- the first thing on that path to call
+`get_platform()`, and therefore the first thing to construct `PlatformXPU`
+-- only on line 155, one line later. By the time this patch would be
+applied, that call has already run against the original, un-pinned
+function. No apply site can fix this without changing verl-core: the
+platform genuinely is not selected yet when the call happens. Checkpoint
+merging is a short, one-shot CPU-bound utility, not a sustained training
+loop, so the cost of staying un-pinned there is far smaller than on the
+training path this patch does cover. (The training path itself is fine:
+`initialize_global_process_group_ray()` on line 90 of `engine_workers.py`
+goes through `get_device_name()`/`get_nccl_backend()`, constructing
+`PlatformXPU` and running this patch, before line 92's call.)
 
-Applying at import time in turn means this module must not decide at *import*
-time whether XPU is the active platform: calling `get_platform()` that early
-would freeze the platform singleton before anything had a chance to call
-`set_platform()`. So the platform check happens at *call* time, inside the
-patched function. That also keeps CUDA and every other platform on their
-existing pynvml path byte for byte, even on a mixed host where Intel GPUs
-merely happen to be present but `VERL_PLATFORM` selects someone else.
+Because `apply()` runs only once XPU is confirmed selected, the platform
+check inside the patched function (`_platform_is_xpu()`) is redundant in the
+common case -- but kept anyway as a cheap guard against the platform
+singleton being reassigned later via `set_platform()`, and because
+`PlatformXPU()` can be constructed and then discarded during auto-detection
+probing on a non-XPU host (see `platform_manager._detect_platform_name()`);
+in that case `apply()` still runs, but the wrapped function's own check
+means it is a no-op for as long as some other platform stays selected.
 """
 
 import logging
@@ -247,9 +257,8 @@ def _resolve_local_rank() -> Optional[int]:
 def _platform_is_xpu() -> bool:
     """Whether verl actually selected XPU for this process.
 
-    Checked at call time, never at patch-application time -- see this
-    module's docstring for why touching `get_platform()` during plugin import
-    would be wrong.
+    Checked at call time even though `apply()` only runs from
+    `PlatformXPU.__init__`: see the end of this module's docstring.
     """
     from verl.plugin.platform import get_platform
 
@@ -259,9 +268,8 @@ def _platform_is_xpu() -> bool:
 def _rebind_importers(original, replacement) -> None:
     """Rebind `set_numa_affinity` in modules that already from-imported it.
 
-    A no-op in the normal case, where this patch runs before either module is
-    imported. Exists so that a future change to verl-core's import order
-    degrades into a still-working patch rather than a silent no-op.
+    Needed because `apply()` runs from `PlatformXPU.__init__`, which is not
+    guaranteed to happen before `engine_workers` binds the original function.
     """
     for name in _IMPORTERS:
         module = sys.modules.get(name)
