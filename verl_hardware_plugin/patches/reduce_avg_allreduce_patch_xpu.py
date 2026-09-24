@@ -2,7 +2,8 @@
 # Licensed under the Apache License, Version 2.0.
 
 """Monkeypatch torch.distributed.all_reduce(op=AVG) -> SUM + manual divide,
-process-wide, for Intel XPU (xccl does not implement ReduceOp.AVG).
+scoped to xccl process groups, for Intel XPU (xccl does not implement
+ReduceOp.AVG).
 
 This is the one patch in this package worth calling "doable, but with a real
 design smell" rather than "clean":
@@ -16,14 +17,18 @@ design smell" rather than "clean":
   (every call site does `dist.all_reduce(...)`, an attribute lookup on the
   `torch.distributed` module performed at call time, not at each file's own
   import time), so this does take effect regardless of load order.
-- The cost is real: this changes the process-wide meaning of
-  `ReduceOp.AVG` for every call site in the process, XPU-related or not.
-  Anyone reading verl-core's source sees real `ReduceOp.AVG` semantics and
-  silently gets SUM+divide instead. That is a legitimate argument for fixing
-  this in verl-core instead (verl-project/verl#7917's
-  `is_reduce_avg_supported()` hook covers exactly these 3 call sites) -- this
-  patch exists to show it is *possible* without core changes, not to claim
-  it is the better design.
+- The cost: this still intercepts a public torch API process-wide -- once
+  applied, every `dist.all_reduce(op=AVG)` call in the process is routed
+  through this wrapper, XPU-related or not. It is scoped to xccl groups via
+  `dist.get_backend(group) != "xccl"`, so a gloo/nccl group in the same
+  process (e.g. a CPU-only Ray actor's coordination group alongside a GPU
+  worker's xccl group) is untouched and keeps native `AVG` -- but anyone
+  reading verl-core's source still can't see, from that source alone, that
+  an xccl group's `ReduceOp.AVG` silently becomes SUM+divide. That is a
+  legitimate argument for fixing this in verl-core instead
+  (verl-project/verl#7917's `is_reduce_avg_supported()` hook covers exactly
+  these 3 call sites) -- this patch exists to show it is *possible* without
+  core changes, not to claim it is the better design.
 
 async_op=True is intentionally unsupported: correctly dividing the result
 requires the collective to have already completed, which async_op explicitly
@@ -59,7 +64,7 @@ def apply() -> None:
     original_all_reduce = dist.all_reduce
 
     def _patched_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
-        if op != dist.ReduceOp.AVG or async_op:
+        if op != dist.ReduceOp.AVG or async_op or dist.get_backend(group) != "xccl":
             return original_all_reduce(tensor, op=op, group=group, async_op=async_op)
 
         world_size = dist.get_world_size(group=group)
@@ -69,4 +74,4 @@ def apply() -> None:
 
     dist.all_reduce = _patched_all_reduce
     _applied = True
-    logger.info("[verl_hardware_plugin] Patched torch.distributed.all_reduce(op=AVG) for XPU/xccl")
+    logger.info("[verl_hardware_plugin] Patched torch.distributed.all_reduce(op=AVG) for xccl process groups")

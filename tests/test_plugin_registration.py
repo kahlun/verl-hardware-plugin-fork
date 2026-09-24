@@ -721,7 +721,9 @@ class TestReduceAvgPatchWiring:
 
 
 class TestReduceAvgAllReducePatch:
-    """torch.distributed.all_reduce(op=AVG) -> SUM + manual divide, XPU only.
+    """torch.distributed.all_reduce(op=AVG) -> SUM + manual divide, scoped to
+    xccl process groups only -- a gloo/nccl group in the same process (e.g. a
+    CPU-only Ray actor's coordination group) must keep native AVG.
 
     _applied is process-global module state (the same property that makes
     this patch risky in production -- see the module's own docstring), so
@@ -766,11 +768,29 @@ class TestReduceAvgAllReducePatch:
                 patched = dist.all_reduce
                 assert patched is not fake_original
 
-                with mock.patch.object(dist, "get_world_size", return_value=4):
-                    patched(tensor, op=dist.ReduceOp.AVG)
+                with mock.patch.object(dist, "get_backend", return_value="xccl"):
+                    with mock.patch.object(dist, "get_world_size", return_value=4):
+                        patched(tensor, op=dist.ReduceOp.AVG)
 
         fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False)
         assert tensor.item() == 1.0
+
+    def test_non_xccl_backend_passes_through_even_with_avg(self):
+        """A gloo/nccl group in the same process must keep native AVG untouched."""
+        import torch
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+
+        fake_original = mock.MagicMock()
+        tensor = torch.tensor([4.0])
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
+            with mock.patch.object(dist, "all_reduce", fake_original):
+                patch_mod.apply()
+                with mock.patch.object(dist, "get_backend", return_value="gloo"):
+                    dist.all_reduce(tensor, op=dist.ReduceOp.AVG, group="cpu_group")
+
+        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.AVG, group="cpu_group", async_op=False)
 
     def test_non_avg_op_passes_through_unchanged(self):
         import torch
