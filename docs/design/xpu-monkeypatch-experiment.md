@@ -27,7 +27,6 @@ and how much they depend on core changes ever landing.
 | `dist_profiler_cls` (VTune tool selection) | Yes | Patch `DistProfiler.__init__` (mutate the class method, not the name) | Clean — see `patches/dist_profiler_patch_xpu.py` docstring for why patching the method and not reassigning the class name matters. |
 | `profiler_markers` (ambient `marked_timer`/`mark_start_range` calls throughout the trainer) | **No** | — | Genuine blocker. `verl/utils/profiler/__init__.py` picks one of three whole modules with an `if/elif/else` **once**, at whatever moment it's first imported by *anything* in the process — there's no per-call dispatch object to patch. Reassigning `verl.utils.profiler.marked_timer` after the fact only helps callers that read that name *after* the patch runs; anything that already did `from verl.utils.profiler import marked_timer` (or `from verl.utils.debug import *`, which re-exports it) earlier keeps its own bound reference. Whether this patch would work in practice depends on winning a race against verl-core's own import order — not a foundation to build on. |
 | `dist_profiler_cls` — rollout-server profiler allowlist (vLLM/SGLang/TRT-LLM async servers) | **No** | — | Genuine blocker, same conclusion as `verl-hardware-plugin#26`: `profiler_config = None` and the call that consumes it are in the same method body, with no hook or registry in between. Nothing to intercept short of forking ~40 lines of server constructor per engine. |
-| `set_numa_affinity` (pyzes NUMA pinning — **not** part of #7917) | Yes | Patch `verl.utils.distributed.set_numa_affinity` wholesale | Clean, but only because `apply_all()` runs before either call site is imported — and it *must not* be applied from `PlatformXPU.__init__`. See below. Replaces the core-hook approach in `verl-hardware-plugin-fork#9` + `kahlun/verl#19`. |
 
 Net: 3 of 4 hooks from #7917 are unnecessary — this plugin already does what
 they'd do, with zero core changes. The 4th (`profiler_markers`) turns out to
@@ -59,48 +58,6 @@ root (`_force_sum_reduction_on_all_fsdp_modules` in `fsdp_xpu.py`), which is
 what `is_reduce_avg_supported`'s FSDP2 wiring in #7917 would have bought —
 achieved here with no patch and no hook.
 
-## Why `set_numa_affinity` can't be patched from `PlatformXPU.__init__`
-
-Every other patch in this package is applied from `PlatformXPU.__init__`, on
-the deliberate reasoning in `patches/__init__.py`: only patch once verl has
-actually *selected* XPU, so a mixed host with `VERL_PLATFORM=nvidia` doesn't
-get its semantics changed just because Intel GPUs happen to be present.
-
-That reasoning breaks for this one capability, because of the order of two
-adjacent lines in `verl/model_merger/megatron_model_merger.py`:
-
-```python
-set_numa_affinity()  # line 154
-torch.distributed.init_process_group(get_nccl_backend())  # line 155
-```
-
-`get_nccl_backend()` is what would first call `get_platform()` and therefore
-first construct `PlatformXPU` — one line *after* the function we need
-patched has already run. `BaseModelMerger.__init__` never touches the
-platform either. So on the checkpoint-merge path a patch applied from
-`PlatformXPU.__init__` would never have been installed, and
-`set_numa_affinity()` would silently no-op: the exact failure shape as the
-bug being fixed. (The training path is fine either way —
-`engine_workers.py:90` calls `initialize_global_process_group_ray()`, which
-goes through `get_device_name()`/`get_nccl_backend()`, before line 92.)
-
-So this patch is applied from `apply_all()` at plugin-import time instead,
-and the "is XPU actually selected?" check moves from *apply* time to *call*
-time (`_platform_is_xpu()`). That preserves the property the original
-reasoning was protecting — non-XPU platforms keep their exact pynvml path —
-without depending on the platform singleton already existing. It also can't
-be done the other way round: calling `get_platform()` during plugin import
-would freeze the singleton before anything could call `set_platform()`.
-
-Import order is what makes the patch itself land, and that part is
-guaranteed rather than lucky: `verl/__init__.py` loads plugin entry_points
-after importing only `.protocol`, `.utils.device`, `.utils.import_utils` and
-`.utils.logging_utils` — none of which reach `engine_workers` or
-`model_merger` — and importing any `verl.*` submodule always runs
-`verl/__init__.py` first. `_rebind_importers()` covers the two from-import
-call sites anyway, so that if verl-core's import order ever changes this
-degrades to a working patch instead of a silent no-op.
-
 ## Comparison
 
 | | Files touched outside this plugin | Depends on #7917 merging |
@@ -108,78 +65,58 @@ degrades to a working patch instead of a silent no-op.
 | PR #22 (`feature/xpu-vtune-avg-attention`) | 0 (but 4 `PlatformXPU` hook methods are dead code without #7917) | Yes, for all 4 hooks |
 | This branch | 0 | No, for 3 of 4. `profiler_markers`'s ambient markers and the rollout-server allowlist remain open — either fork ~40 lines of server code into the plugin, or ask for the two small core changes verl-hardware-plugin#26 already discusses. |
 
+## Failure policy for the patches
+
+Every module in `patches/` shares one XPU guard (`patches/_xpu_guard.py`) and
+is a hard no-op on a CPU/CUDA/NPU process — the entry point is discovered on
+every host, not just Intel ones, and all three patches mutate process-global
+state (`torch.distributed.all_reduce`, `verl.utils.attention_utils.
+_get_attention_functions`, `DistProfiler.__init__`). Patching any of those on
+another vendor's host changes *that* vendor's behavior.
+
+`apply_all()` splits failures by consequence rather than swallowing them:
+
+| Patch | On failure, on an XPU host |
+|---|---|
+| `reduce_avg_allreduce_patch_xpu` | **raise** — oneCCL's `ReduceOp.AVG` is not reliably available; continuing risks a mid-collective abort or wrong gradients |
+| `attention_patch_xpu` | **raise** — rmpad attention needs the XPU function set |
+| `dist_profiler_patch_xpu` | `logger.exception`, continue — losing `tool: vtune` costs observability, not correctness |
+
+On a non-XPU host nothing was going to install anyway, so a failure is
+debug-logged and never raised.
+
+## Hardware validation
+
+Run on 2×B60 (Intel Arc Pro B60 Graphics) via devctl, 2026-09-24, inside the
+image built by PR #2's `docker/intel_gpu/Dockerfile.intel_gpu` with this
+branch as the build context (verl-core `cbf4f31b`, torch `2.13.0+xpu`, vLLM
+`0.29.0`):
+
+- 85 unit tests pass in-image.
+- All three patches install on an XPU host; none install in the same image on
+  a CPU-only container (`dist.all_reduce` and `DistProfiler.__init__` verified
+  untouched there).
+- `attention_utils._get_attention_functions()` returns the
+  `verl.utils.npu_flash_attn_utils` set; `profiler.tool: vtune` resolves to
+  `VtuneProfiler`.
+- 2-rank xccl: patched `all_reduce(AVG)` returns the true mean (1.5 for ranks
+  contributing 1 and 2), `SUM` is unaffected.
+- PR #8's premise holds on this image: verl-core `cbf4f31b` *does* define
+  `attention_utils_module`/`profiler_markers`/`dist_profiler_cls` on
+  `PlatformBase`, and this plugin overrides none of them — so the hooks are
+  inert and the patches are what produced the results above.
+
+One caveat worth recording, since it is easy to misread: a plugin-free
+baseline on the same pod showed unpatched xccl computing `ReduceOp.AVG`
+*correctly* (both sync and async) for a small 2-rank tensor. That does not
+contradict the patch — oneCCL implements AVG on its SYCL-kernel path and not
+its scheduler path, and path selection is internal, so a small collective can
+land on the working path. It does mean a 2-rank smoke test cannot demonstrate
+the failure the patch prevents.
+
 ## Not yet done
 
-- No hardware validation for the four #7917-related capabilities — those were
-  built and reasoned through against `verl-core`'s real `main` source (via
-  GitHub, not a live checkout), not run on a B60. Treat their "clean" verdicts
-  above as "verified against source," not "verified end-to-end."
-- Unit tests cover `numa_affinity_patch_xpu` only
-  (`tests/test_numa_affinity_patch_xpu.py`, 24 cases, passing — verl and pyzes
-  are both stubbed so it runs on a CPU-only host). `attention_patch_xpu`,
-  `dist_profiler_patch_xpu` and `reduce_avg_allreduce_patch_xpu` still have
-  none.
-- `set_numa_affinity` is the exception — it **is** hardware-verified. See the
-  section below.
-- Watch item for a multi-GPU/Ray run: `_resolve_local_rank()` returns the
-  global device id Ray assigned, while pyzes enumerates only the devices
-  visible to the process. Those agree when
-  `RAY_EXPERIMENTAL_NOSET_ZE_AFFINITY_MASK` is set and can disagree when Ray
-  sets `ZE_AFFINITY_MASK` per worker. The pynvml path this replaces has the
-  identical property, so it isn't a regression introduced here — but a log
-  line reading `out of range for N zes-visible device(s)` is this, and it
-  would mean the same latent issue exists on CUDA today. The verification run
-  below had `ZE_AFFINITY_MASK` unset, so it did not exercise the disagreeing
-  case.
-
-## Hardware verification: `set_numa_affinity` (2026-09-24)
-
-Run via `devctl test --gpu=2 --gpu-model=B60` on image
-`verl-intel-gpu:pr8-monkeypatch-20260924`, with this branch's
-`verl_hardware_plugin` overlaid onto the image's editable install
-(`scripts/devctl_verify_numa.sh` → `scripts/verify_numa_patch_xpu.py`).
-6/6 checks passed, exit 0:
-
-```
-set_numa_affinity -> verl_hardware_plugin.patches.numa_affinity_patch_xpu.apply.<locals>._patched_set_numa_affinity
-[PASS] verl.utils.distributed.set_numa_affinity is patched
-[PASS] verl selected the XPU platform            device_name='xpu' vendor='intel'
-[PASS] engine_workers' from-imported binding is the patched function
-  local_rank=0 bdf=0000:3d:00.0 numa_node=0 cpulist=0-127,256-383
-[PASS] resolved PCI BDF via pyzes
-[PASS] affinity pinning changed this process's cpuset    512 cpus -> 256 cpus
-```
-
-Three things this establishes that source review could not:
-
-1. The patch really is installed inside a real verl process, with **zero**
-   verl-core changes — the plugin was loaded through its normal
-   `verl.plugins` entry point, nothing else.
-2. The import-order argument holds *live*: `verl.workers.engine_workers`'s
-   own from-imported binding is the patched function, not the original
-   pynvml one. This is the claim the whole approach rests on, and it is the
-   one that a silent no-op would have hidden.
-3. Pinning actually happens: the process's cpuset went from all 512 logical
-   CPUs to the 256 local to the GPU's NUMA node. Before this patch, that
-   call was a no-op on XPU.
-
-### Found by this run: pyzes 0.1.1 has no PCI API
-
-The first attempt failed with
-`AttributeError: module 'pyzes' has no attribute 'zes_pci_properties_t'`.
-The image ships **pyzes 0.1.1**, which contains *no* PCI symbols at all —
-`zesDevicePciGetProperties`, `zes_pci_properties_t` and `zes_pci_address_t`
-were all added by oneapi-src/level-zero#462 and first released in **0.1.2**
-(2026-06-12). Confirmed by diffing `dir(pyzes)` across both versions.
-
-This is a latent defect in the implementation inherited from
-`verl-hardware-plugin-fork#9`, and it applies to the `PlatformBase`-hook
-version of this code equally: the failure surfaces as an unhelpful
-`AttributeError`, swallowed into a warning, leaving the run silently
-un-pinned. `_zes_device_pci_bdf()` now checks for the symbol up front and
-raises a message naming the required version instead.
-
-Consequence for the image: `pyzes>=0.1.2` needs to land in
-`docker/intel_gpu/requirements-intel-gpu.txt` (the `feature/xpu-docker`
-branch). That file currently pins neither pyzes nor pynvml — the image gets
-0.1.1 transitively.
+- No end-to-end GRPO training run on this branch; the validation above
+  exercises the patches directly, not a full trainer loop.
+- No unit tests yet for the two capabilities this branch deliberately does
+  *not* patch (they are argued from source, not exercised).
