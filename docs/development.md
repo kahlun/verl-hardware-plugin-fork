@@ -1055,6 +1055,34 @@ When submitting a PR for a new hardware platform, you must provide:
 
 ---
 
+## Automatic verl Release Compatibility
+
+`.github/workflows/verl-release-compat.yml` checks the latest stable semantic-version tag in
+`verl-project/verl` every day. The last validated tag is stored in
+`compat/verl-release.json`, together with the immutable commit resolved from that tag.
+
+When a new tag appears, the workflow checks every statically imported verl API and runs
+the CPU unit test suite against that exact tag. If the checks pass, it opens a draft PR
+that advances the validated tag. If installation or compatibility checks fail, it creates
+or updates a tag-specific issue with a link to the diagnostic artifact. The marker is not
+advanced until the exact upstream commit passes the compatibility gate.
+
+The monitor runs entirely on GitHub-hosted runners and uses only the built-in
+`GITHUB_TOKEN`; it needs no external automation service, API key, or GitHub Environment.
+Upstream code is installed and tested only in a read-only job. The separate publication
+job has write permission, but it never checks out or executes upstream code and stages
+only `compat/verl-release.json`.
+
+Repository administrators must enable **Actions → General → Workflow permissions →
+Allow GitHub Actions to create and approve pull requests**. If that setting is disabled,
+the workflow reports the publication failure in an issue. It never auto-merges its PRs;
+CODEOWNERS review and hardware validation still apply.
+
+The workflow runs daily at 02:17 UTC and can also be started manually from the `main`
+branch in the Actions tab.
+
+---
+
 ## Related Resources
 
 - **verl core PR**: [verl#6086 — Platform & Engine Registry](https://github.com/verl-project/verl/pull/6086)
