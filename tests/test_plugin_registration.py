@@ -706,15 +706,18 @@ class TestReduceAvgPatchWiring:
     def test_platform_xpu_init_applies_patches(self):
         from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
 
-        with mock.patch("verl_hardware_plugin.patches.apply_all") as fake_apply_all:
+        with mock.patch(
+            "verl_hardware_plugin.patches.reduce_avg_allreduce_patch_xpu.apply"
+        ) as fake_apply:
             PlatformXPU()
 
-        fake_apply_all.assert_called_once()
+        fake_apply.assert_called_once()
 
-    def test_plugin_init_does_not_bind_apply_all_patches(self):
+    def test_plugin_init_does_not_bind_reduce_avg_patch(self):
         import verl_hardware_plugin
 
         assert not hasattr(verl_hardware_plugin, "apply_all_patches")
+        assert not hasattr(verl_hardware_plugin, "reduce_avg_allreduce_patch_xpu")
 
 
 class TestReduceAvgAllReducePatch:

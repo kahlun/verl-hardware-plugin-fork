@@ -1,46 +1,20 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Plugin-side monkeypatch for Intel XPU reduce_avg support, applied with
-zero changes to verl-core and with no dependency on any new PlatformBase
-hook.
+"""Plugin-side monkeypatches, one module per capability, applied only from
+the platform class that needs them -- not from this package's `__init__.py`
+and not from this plugin's shared top-level `verl_hardware_plugin/__init__.py`.
 
-Per the maintainer's ruling on verl-hardware-plugin#26 (2026-09-23): default
-new hardware backends to plugin-side monkeypatching, reserving new
-PlatformBase hooks for capabilities that genuinely can't be done from the
-plugin. `attention_utils_module()` passed that bar and stays a hook
-(implemented in `platforms/platform_xpu.py`, see PR #22) — this package only
-covers `is_reduce_avg_supported`, the one capability that didn't.
+`PlatformXXX()` is only constructed once `verl.plugin.platform.
+platform_manager._create_platform()` has actually selected that platform for
+the process (see `PlatformXPU.__init__` in `platforms/platform_xpu.py`).
+Applying a patch from a shared location instead would fire on any host where
+the corresponding hardware/SDK merely happens to be importable, regardless of
+which platform verl actually selects for the run.
 
-Call `apply_all()` from `PlatformXPU.__init__`, not from this plugin's
-top-level `verl_hardware_plugin/__init__.py`: the latter runs on any host
-where XPU merely happens to be importable, regardless of which platform
-verl actually selects for the run, whereas `PlatformXPU()` is only
-constructed once XPU is the selected platform (see
-`verl.plugin.platform.platform_manager._create_platform`).
+Currently contains one module:
 
-The VTune/dist_profiler_cls monkeypatch is a separate, unrelated concern and
-intentionally not part of this package — it ships as its own branch/PR so
-the two can be reviewed and merged independently.
-
-The patch module is guarded by an XPU-availability check, and apply_all() is
-idempotent, so calling it is safe even when another vendor's platform (or no
-accelerator at all) ends up selected in the same process.
+- `reduce_avg_allreduce_patch_xpu`: Intel XPU's `is_reduce_avg_supported`
+  replacement. See its own docstring for what it does and why it's a
+  monkeypatch rather than a `PlatformBase` hook (verl-hardware-plugin#26).
 """
-
-import logging
-import os
-
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-
-def apply_all() -> None:
-    """Apply every XPU monkeypatch. Safe to call multiple times or on non-XPU hosts."""
-    from . import reduce_avg_allreduce_patch_xpu
-
-    for module in (reduce_avg_allreduce_patch_xpu,):
-        try:
-            module.apply()
-        except Exception as e:
-            logger.debug("%s.apply() skipped: %s", module.__name__, e)

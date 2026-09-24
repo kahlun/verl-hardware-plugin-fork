@@ -78,20 +78,20 @@ class PlatformXPU(PlatformBase):
     """
 
     def __init__(self) -> None:
-        # Apply plugin-side monkeypatches only now, when XPU is actually the
-        # platform verl selected for this process (verl.plugin.platform.
+        # Apply this platform's monkeypatch only now, when XPU is actually
+        # the platform verl selected for this process (verl.plugin.platform.
         # platform_manager._create_platform() only constructs PlatformXPU()
         # when platform detection -- explicit VERL_PLATFORM=intel or
-        # auto-detection -- picked "intel"). Applying this from the shared
+        # auto-detection -- picked "intel"). Applying it from the shared
         # verl_hardware_plugin/__init__.py instead would fire on any host
         # where XPU hardware/SDK merely happens to be present, even if a
         # different platform ends up selected for this run -- e.g. a mixed
         # host with VERL_PLATFORM=nvidia explicitly set would still get its
         # process-wide torch.distributed.all_reduce(op=AVG) semantics
-        # changed for no reason. See patches/reduce_avg_allreduce_patch_xpu.py.
-        from verl_hardware_plugin.patches import apply_all as apply_all_patches
+        # changed for no reason.
+        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu
 
-        apply_all_patches()
+        reduce_avg_allreduce_patch_xpu.apply()
 
     # ------------------------------------------------------------------
     # Core device management
