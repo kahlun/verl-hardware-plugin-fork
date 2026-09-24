@@ -8,6 +8,19 @@ torch==2.13.0+xpu
 # Runtime deps imported directly by the verl XPU rollout/training paths.
 cachetools
 #
+# pyzes>=0.1.2 is deliberately NOT listed here — it is installed by the
+# Dockerfile immediately after this file, with --no-deps. Adding it here
+# breaks the build outright:
+#
+#   error: No solution found when resolving dependencies
+#     cause: Because torch==2.13.0+xpu depends on pyzes==0.1.1 ... and because
+#            you require pyzes>=0.1.2, your requirements are unsatisfiable.
+#
+# torch==2.13.0+xpu pins pyzes to an *exact* version (==0.1.1), and this file
+# is installed with dependency resolution on, so the two constraints cannot
+# coexist. See the Dockerfile's "pyzes" step for why 0.1.1 isn't good enough
+# and why overriding torch's pin is safe.
+#
 # vLLM >= 0.17 with XPU support must be built from source:
 #   VLLM_TARGET_DEVICE=xpu pip install --no-build-isolation -v .
 #

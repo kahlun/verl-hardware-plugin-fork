@@ -191,6 +191,35 @@ RUN set -eux && \
 COPY docker/intel_gpu/requirements-intel-gpu.txt /tmp/requirements-intel-gpu.txt
 RUN set -eux && uv pip install -r /tmp/requirements-intel-gpu.txt
 
+# pyzes >= 0.1.2, installed separately and deliberately overriding torch's own
+# exact pin (torch==2.13.0+xpu declares pyzes==0.1.1). This cannot go in
+# requirements-intel-gpu.txt: that file is installed with resolution on, and uv
+# correctly rejects the pair as unsatisfiable --
+#   Because torch==2.13.0+xpu depends on pyzes==0.1.1 ... and because you
+#   require pyzes>=0.1.2, your requirements are unsatisfiable.
+# --no-deps is what lets the newer version land anyway.
+#
+# Why 0.1.1 isn't enough: this plugin sets NUMA affinity on XPU via
+# zesDevicePciGetProperties -> PCI BDF -> sysfs numa_node/cpulist ->
+# sched_setaffinity, because verl's own set_numa_affinity() pins via pynvml,
+# which doesn't exist here. pyzes 0.1.1 ships NO PCI symbols at all;
+# zesDevicePciGetProperties, zes_pci_properties_t and zes_pci_address_t were
+# added by oneapi-src/level-zero#462 and first released in 0.1.2 (2026-06-12).
+# On 0.1.1 the pinning call dies with
+#   AttributeError: module 'pyzes' has no attribute 'zes_pci_properties_t'
+# which the caller swallows into a warning, so the job runs silently
+# un-NUMA-pinned -- the exact failure this code exists to prevent. Observed on
+# a real B60 run against an image that resolved 0.1.1 transitively.
+#
+# Why overriding torch's pin is safe: 0.1.2 is purely additive over 0.1.1 (that
+# PR is titled "Add more APIs to L0 Sysman python binding"), and torch.xpu only
+# calls the telemetry APIs, which are unchanged. Verified on B60 with this exact
+# combination -- torch 2.13.0+xpu on pyzes 0.1.2 loaded the full verl stack and
+# reported torch.xpu.device_count()=2. Re-check if the torch pin ever moves.
+RUN set -eux && \
+    uv pip install --no-deps "pyzes>=0.1.2" && \
+    python3 -c "import pyzes; assert hasattr(pyzes, 'zesDevicePciGetProperties'), 'pyzes is missing the PCI API'"
+
 RUN set -eux && cd /opt/verl && uv pip install --no-deps -e .
 
 # xgrammar (via vLLM's common.txt) pulls in plain triton as a transitive dep.
