@@ -197,23 +197,6 @@ class PlatformXPU(PlatformBase):
         return False
 
     # ------------------------------------------------------------------
-    # Collective communication quirks
-    # ------------------------------------------------------------------
-
-    def is_reduce_avg_supported(self) -> bool:
-        # xccl (oneAPI Collective Communications Library) does not implement
-        # ReduceOp.AVG for all_reduce/reduce_scatter (see the class docstring
-        # above). verl core uses this to fall back to SUM + manual divide for
-        # plain all_reduce (verl/utils/device.py:all_reduce_avg) and to call
-        # model.set_force_sum_reduction_for_comms(True) for FSDP2
-        # (verl/utils/fsdp_utils.py:apply_fsdp2) when this is False.
-        # fsdp_xpu.py's engine-level force_sum_reduction call stays in place
-        # alongside this — it's what actually enables the workaround on verl
-        # versions that predate this hook; the two are redundant but harmless
-        # once both are present.
-        return False
-
-    # ------------------------------------------------------------------
     # Attention kernels
     # ------------------------------------------------------------------
 

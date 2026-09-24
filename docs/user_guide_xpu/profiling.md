@@ -13,8 +13,8 @@ verl core discovers without needing to know about ITT or XPU itself.
 
 ## Prerequisites
 
-- These hooks (`is_reduce_avg_supported`, `attention_utils_module`,
-  `profiler_markers`, `dist_profiler_cls`) only exist on a verl-core build that
+- These hooks (`attention_utils_module`, `profiler_markers`,
+  `dist_profiler_cls`) only exist on a verl-core build that
   includes [verl-project/verl#7917](https://github.com/verl-project/verl/pull/7917)
   ("enable intel XPU to Verl with plugin mechanism with extra General API
   abstraction"), currently **open, not yet merged**. Against stock verl-core

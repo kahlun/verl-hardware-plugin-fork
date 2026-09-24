@@ -12,7 +12,7 @@ This document describes how to use verl for reinforcement learning training on I
 
 ```text
 verl_hardware_plugin/
-├── platforms/platform_xpu.py   # Platform metadata + reduce_avg/attention/profiler hooks
+├── platforms/platform_xpu.py   # Platform metadata + attention/profiler hooks
 ├── engines/fsdp_xpu.py         # FSDP/FSDP2 actor + critic engines, xccl reduce_avg workaround
 ├── engines/megatron_xpu.py     # Megatron engine registration (not yet validated end-to-end)
 └── profilers/itt_profile_xpu.py  # Intel VTune (ITT) profiler integration

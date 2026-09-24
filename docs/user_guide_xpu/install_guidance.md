@@ -12,17 +12,18 @@ in verl-core for the plugin pattern this follows.
   do not ship XPU kernels)
 - oneCCL runtime for the `xccl` distributed backend
 
-**verl-core version note:** the `is_reduce_avg_supported()`,
-`attention_utils_module()`, `profiler_markers()`, and `dist_profiler_cls()`
-hooks this plugin implements only exist on verl-core builds that include
+**verl-core version note:** the `attention_utils_module()`,
+`profiler_markers()`, and `dist_profiler_cls()` hooks this plugin implements
+only exist on verl-core builds that include
 [verl-project/verl#7917](https://github.com/verl-project/verl/pull/7917),
 which has not merged yet. Against a `verl-project/verl:main` checkout
-without it, this plugin still installs and runs, but those four hooks
-silently no-op: the reduce_avg workaround still applies (via the redundant
-engine-level call in `fsdp_xpu.py`), but attention padding falls back to the
-generic implementation and `profiler.tool: vtune` will not resolve to a
-profiler. Use the pinned ref in [`docker/intel_gpu/`](../../docker/intel_gpu/)
-for a known-good combination until #7917 merges.
+without it, this plugin still installs and runs, but those three hooks
+silently no-op: attention padding falls back to the generic implementation
+and `profiler.tool: vtune` will not resolve to a profiler. The `xccl`
+reduce_avg workaround is unaffected either way — it's applied entirely from
+this plugin's own `fsdp_xpu.py` engine, not through a `PlatformBase` hook.
+Use the pinned ref in [`docker/intel_gpu/`](../../docker/intel_gpu/) for a
+known-good combination until #7917 merges.
 
 ## 1. Install verl and verl-hardware-plugin
 
