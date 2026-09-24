@@ -7,19 +7,27 @@ Extends the base FSDP engine with XPU-specific workarounds
 (e.g., force sum reduction for xccl backend).
 
 Why is this engine needed?
-    The Intel xccl collective communication backend does NOT support
-    ReduceOp.AVG for allreduce operations. FSDP's gradient synchronization
+    Intel's oneCCL (xccl) collective library implements ReduceOp.AVG on its
+    SYCL-kernel execution path, but not on its scheduler path -- and which
+    path a given collective takes is selected internally by oneCCL, not
+    capability-aware, so an AVG request can abort mid-collective
+    (`average operation is not supported for the scheduler path`) rather
+    than reliably succeed or reliably fail. FSDP's gradient synchronization
     normally uses AVG for efficiency. This engine forces sum-based reduction
-    followed by manual division, which is functionally equivalent but
-    compatible with xccl.
+    followed by manual division, which is functionally equivalent and,
+    unlike AVG, not subject to that path-selection abort. (Fix tracked for
+    oneCCL 2022.2 / torch 2.15; not yet available on the stack this plugin
+    targets. A separate, narrower double-division bug on very small
+    messages, intel/torch-xpu-ops#3020, is fixed on that same stack and is
+    not what this workaround is for.)
 
 Why not patch verl-core's apply_fsdp2() instead?
     verl/workers/engine/fsdp/transformer_impl.py does
     `from verl.utils.fsdp_utils import apply_fsdp2` at its own import time, so a
     plugin that reassigns `verl.utils.fsdp_utils.apply_fsdp2` after that module
     has already imported the name would have no effect on this call site --
-    the same import-order fragility as verl core's profiler-marker dispatch
-    (see docs/design/ for that one). This engine sidesteps the problem
+    the same import-order fragility that motivates verl core's own
+    profiler-marker dispatch design. This engine sidesteps the problem
     entirely: it does not patch anything. It calls
     set_force_sum_reduction_for_comms() on the already-constructed model
     *after* super().initialize() (which internally calls the real
@@ -61,7 +69,8 @@ def _force_sum_reduction_on_all_fsdp_modules(root) -> None:
     root model (verl/utils/fsdp_utils.py::apply_fsdp2), so each of those
     per-layer wrappers has its own communication group that also defaults to
     ReduceOp.AVG. Only fixing the root leaves per-layer gradient sync using
-    AVG, which xccl silently cannot execute correctly.
+    AVG, which is subject to oneCCL's unreliable AVG path selection (see
+    module docstring) instead of the guaranteed-correct SUM+divide path.
     """
     if hasattr(root, "set_force_sum_reduction_for_comms"):
         root.set_force_sum_reduction_for_comms(True)
@@ -97,12 +106,14 @@ class FSDPXPUEngineWithLMHead(FSDPEngineWithLMHead):
         """Initialize the FSDP model, then apply XPU-specific workarounds.
 
         The key workaround: force sum-based gradient reduction, root module
-        and every per-layer FSDP2 wrapper. This is needed because xccl does
-        not support ReduceOp.AVG. The FSDP wrapper will use SUM + manual
+        and every per-layer FSDP2 wrapper. This is needed because oneCCL's
+        AVG path selection isn't capability-aware and can abort mid-collective
+        (see module docstring). The FSDP wrapper will use SUM + manual
         division instead.
         """
         super().initialize()
-        # xccl does not support ReduceOp.AVG; force sum-based reduction
+        # oneCCL's AVG path selection isn't capability-aware and can abort;
+        # force sum-based reduction instead (see module docstring)
         _force_sum_reduction_on_all_fsdp_modules(self.module)
 
 

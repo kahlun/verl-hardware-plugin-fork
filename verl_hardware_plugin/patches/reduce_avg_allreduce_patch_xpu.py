@@ -2,8 +2,19 @@
 # Licensed under the Apache License, Version 2.0.
 
 """Monkeypatch torch.distributed.all_reduce(op=AVG) -> SUM + manual divide,
-scoped to xccl process groups, for Intel XPU (xccl does not implement
-ReduceOp.AVG).
+scoped to xccl process groups, for Intel XPU.
+
+Why this is needed: Intel's oneCCL (xccl) implements ReduceOp.AVG on its
+SYCL-kernel execution path, but not on its scheduler path. Which path a
+given collective takes is selected internally by oneCCL and isn't
+capability-aware, so a caller can't tell in advance whether an AVG request
+will succeed or abort mid-collective (`average operation is not supported
+for the scheduler path`). Forcing sum-based reduction + a manual divide is
+the only way to guarantee correctness until that dispatch becomes
+capability-aware -- fix tracked for oneCCL 2022.2 / torch 2.15, not yet
+available on the stack this plugin targets. (A separate, narrower
+double-division bug on very small messages, intel/torch-xpu-ops#3020, is
+fixed on that same stack and is not what this patch works around.)
 
 This is the one patch in this package worth calling "doable, but with a real
 design smell" rather than "clean":
@@ -33,8 +44,9 @@ design smell" rather than "clean":
 async_op=True is intentionally unsupported: correctly dividing the result
 requires the collective to have already completed, which async_op explicitly
 defers. Call sites using async_op=True with op=AVG fall through to the
-original (broken-on-xccl) behavior rather than silently producing a wrong
-answer with no error.
+original behavior -- subject to the same oneCCL path-selection risk this
+patch exists to avoid -- rather than silently producing a wrong answer with
+no error.
 """
 
 import logging
