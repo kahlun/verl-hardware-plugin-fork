@@ -70,7 +70,7 @@ docker run -it --rm --device /dev/dri --group-add ${RENDER_GID} \
 |---------|---------|--------|
 | PyTorch XPU | from vLLM xpu requirements | `https://download.pytorch.org/whl/xpu` |
 | oneCCL runtime | installed in image via oneAPI / oneCCL bundle | bundled in image |
-| vLLM | from Dockerfile `VLLM_VERSION` | built from source with `VLLM_TARGET_DEVICE=xpu` |
+| vLLM | from Dockerfile `VLLM_VERSION` | prebuilt XPU wheel from `wheels.vllm.ai` |
 | verl core | from Dockerfile `VERL_GIT_REPO`/`VERL_REF` | git-cloned, `pip install --no-deps -e .` |
 | verl deps | from `requirements-intel-gpu.txt` | PyPI and extra indexes |
 | verl-hardware-plugin (this repo) | local build context | `pip install --no-deps -e .` |

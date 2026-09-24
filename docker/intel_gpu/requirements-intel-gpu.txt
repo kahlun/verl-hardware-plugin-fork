@@ -1,7 +1,7 @@
 # Requirements for Intel XPU
 #
 # PyTorch with XPU support is installed by docker/intel_gpu/Dockerfile.intel_gpu, NOT here.
-# Version must match vLLM XPU requirements (vLLM v0.27.0 pins torch==2.13.0+xpu).
+# Version must match vLLM XPU requirements (vLLM v0.29.0 pins torch==2.13.0+xpu).
 # Pinned here as a hard backstop so uv/pip cannot drift to a CUDA or CPU wheel.
 # Do NOT remove this pin.
 torch==2.13.0+xpu
@@ -79,7 +79,7 @@ pybind11
 pylatexenc
 qwen_vl_utils
 ray[default]
-TransferQueue==0.1.8
+TransferQueue==0.1.10
 tensorboard
 tensordict>=0.10.0
 torchdata
