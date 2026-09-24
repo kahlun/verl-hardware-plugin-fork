@@ -65,10 +65,30 @@ achieved here with no patch and no hook.
 | PR #22 (`feature/xpu-vtune-avg-attention`) | 0 (but 4 `PlatformXPU` hook methods are dead code without #7917) | Yes, for all 4 hooks |
 | This branch | 0 | No, for 3 of 4. `profiler_markers`'s ambient markers and the rollout-server allowlist remain open — either fork ~40 lines of server code into the plugin, or ask for the two small core changes verl-hardware-plugin#26 already discusses. |
 
+## Failure policy for the patches
+
+Every module in `patches/` shares one XPU guard (`patches/_xpu_guard.py`) and
+is a hard no-op on a CPU/CUDA/NPU process — the entry point is discovered on
+every host, not just Intel ones, and all three patches mutate process-global
+state (`torch.distributed.all_reduce`, `verl.utils.attention_utils.
+_get_attention_functions`, `DistProfiler.__init__`). Patching any of those on
+another vendor's host changes *that* vendor's behavior.
+
+`apply_all()` splits failures by consequence rather than swallowing them:
+
+| Patch | On failure, on an XPU host |
+|---|---|
+| `reduce_avg_allreduce_patch_xpu` | **raise** — xccl cannot execute `ReduceOp.AVG`; continuing produces wrong gradients with no error |
+| `attention_patch_xpu` | **raise** — rmpad attention needs the XPU function set |
+| `dist_profiler_patch_xpu` | `logger.exception`, continue — losing `tool: vtune` costs observability, not correctness |
+
+On a non-XPU host nothing was going to install anyway, so a failure is
+debug-logged and never raised.
+
 ## Not yet done
 
-- No hardware validation — this was built and reasoned through against
-  `verl-core`'s real `main` source (via GitHub, not a live checkout), not
-  run on a B60. Treat the "clean" verdicts above as "verified against
-  source," not "verified end-to-end."
-- No unit tests yet for `patches/`.
+- Hardware validation status: see the PR's test-plan checklist. The "clean"
+  verdicts above were reasoned against `verl-core`'s real `main` source; read
+  them as "verified against source" until a B60 run is recorded there.
+- No unit tests yet for the two capabilities this branch deliberately does
+  *not* patch (they are argued from source, not exercised).

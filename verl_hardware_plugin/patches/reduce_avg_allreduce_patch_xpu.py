@@ -35,23 +35,19 @@ answer with no error.
 import logging
 import os
 
+from ._xpu_guard import xpu_available
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _applied = False
 
 
-def _xpu_available() -> bool:
-    import torch
-
-    return hasattr(torch, "xpu") and torch.xpu.is_available()
-
-
 def apply() -> None:
     global _applied
     if _applied:
         return
-    if not _xpu_available():
+    if not xpu_available():
         return
 
     import torch.distributed as dist
