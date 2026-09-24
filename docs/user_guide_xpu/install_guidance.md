@@ -8,8 +8,13 @@ in verl-core for the plugin pattern this follows.
 ## Prerequisites
 
 - PyTorch with XPU support (`torch.xpu.is_available() == True`)
-- vLLM built from source with `VLLM_TARGET_DEVICE=xpu` (vLLM's `pip` wheels
-  do not ship XPU kernels)
+- vLLM with XPU kernels — either the prebuilt wheel from vLLM's XPU wheel
+  index (`pip install "vllm==<version>+xpu" --extra-index-url
+  https://wheels.vllm.ai/<version>/xpu`; see
+  [`docker/intel_gpu/Dockerfile.intel_gpu`](../../docker/intel_gpu/Dockerfile.intel_gpu)
+  for the exact pinned command) or built from source with
+  `VLLM_TARGET_DEVICE=xpu`. The default PyPI `pip install vllm` wheel does
+  not ship XPU kernels.
 - oneCCL runtime for the `xccl` distributed backend
 
 **verl-core version note:** the `attention_utils_module()`,
@@ -67,8 +72,9 @@ in the environment.
 
 A prebuilt image definition is at
 [`docker/intel_gpu/`](../../docker/intel_gpu/) in this repo — it clones
-verl-core at a pinned ref, builds vLLM from source for XPU, and installs this
-plugin on top. See [`docker/intel_gpu/README.md`](../../docker/intel_gpu/README.md)
+verl-core at a pinned ref, installs vLLM from its prebuilt XPU wheel index,
+and installs this plugin on top. See
+[`docker/intel_gpu/README.md`](../../docker/intel_gpu/README.md)
 for build/run instructions and the full software stack table. This is the
 fastest way to get a known-good verl-core + plugin combination, since it
 sidesteps the verl-core version note above.

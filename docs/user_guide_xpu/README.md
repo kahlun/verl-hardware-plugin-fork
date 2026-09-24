@@ -1,6 +1,6 @@
 # Intel XPU User Guide
 
-Last updated: 09/22/2026.
+Last updated: 09/24/2026.
 
 ## Introduction
 
@@ -14,7 +14,7 @@ This document describes how to use verl for reinforcement learning training on I
 verl_hardware_plugin/
 ├── platforms/platform_xpu.py   # Platform metadata + attention/profiler hooks
 ├── engines/fsdp_xpu.py         # FSDP/FSDP2 actor + critic engines, xccl reduce_avg workaround
-├── engines/megatron_xpu.py     # Megatron engine registration (not yet validated end-to-end)
+├── engines/megatron_xpu.py     # Megatron engine registration (Work in Progress — not yet validated end-to-end)
 └── profilers/itt_profile_xpu.py  # Intel VTune (ITT) profiler integration
 ```
 

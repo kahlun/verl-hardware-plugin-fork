@@ -6,14 +6,14 @@ plugin installed (see [`install_guidance.md`](install_guidance.md) first).
 Current software and hardware scope:
 
 - Runtime mode: **Colocate** (FSDP actor + vLLM rollout on the same device).
-- Inference engine: **vLLM** validated. SGLang weight sync not yet supported
-  on Intel GPU.
-- Trainer backend: **FSDP**, **FSDP2**. Megatron not yet validated.
+- Inference engine: **vLLM** validated. SGLang weight sync — Work in
+  Progress on Intel GPU.
+- Trainer backend: **FSDP**, **FSDP2**. Megatron — Work in Progress.
 - Algorithms: GRPO, PPO, SFT — validated on GSM8K / Qwen2.5.
 - Hardware targets:
   - Intel Arc Pro B60 (Battlemage, 24 GB) — validated, 1-GPU and 2-GPU
   - Intel Arc Pro B70 (2x GPU, 32 GB each)
-  - Multi-node — not yet tested
+  - Multi-node — Work in Progress
 
 ## 1. Verify Platform Resolution
 
@@ -105,13 +105,13 @@ Intel GPU attached.
 | Category | Status | Notes |
 |---|---|---|
 | Runtime mode | Colocate | FSDP/FSDP2 actor + vLLM rollout on same GPU(s) |
-| Inference engine | vLLM validated | SGLang: `update_weights` not yet supported |
-| Trainer backend | FSDP, FSDP2 | Megatron not yet validated |
+| Inference engine | vLLM validated | SGLang: `update_weights` — Work in Progress |
+| Trainer backend | FSDP, FSDP2 | Megatron — Work in Progress |
 | Algorithms | GRPO, PPO, SFT | Validated on GSM8K / Qwen2.5 |
 | Hardware (1-GPU) | Validated | Arc Pro B60: 51.2 s/step, 148.2 tok/s (batch 16, Qwen2.5-0.5B) |
 | Hardware (2-GPU) | Validated | Arc Pro B60 x2: 93.0 s/step at same batch size |
-| Multi-node | Not yet tested | — |
-| Profiler | Intel VTune (ITT) | Set `profiler.tool: vtune`; requires verl-core with [verl#7917](https://github.com/verl-project/verl/pull/7917) (see install_guidance.md) |
+| Multi-node | Work in Progress | — |
+| Profiler | Intel VTune (ITT) — Work in Progress | Pending upstream verl-core merge; see [profiling.md](./profiling.md) |
 
 ## Next Steps
 
