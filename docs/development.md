@@ -577,13 +577,19 @@ class FSDPMyVendorEngineWithLMHead(FSDPEngineWithLMHead):
         - Force sum reduction if the comm backend doesn't support AVG
         - Enable/disable specific FSDP features
         - Apply vendor-specific optimizations
+
+        The wrapped model is `self.module`, assigned by
+        `FSDPEngine._build_model_optimizer()` (called from `initialize()`) in
+        verl/workers/engine/fsdp/transformer_impl.py. There is no `self.model`
+        on these engines -- only `self.model_config` -- so a `hasattr(self.model,
+        ...)` guard here silently never fires.
         """
         super().initialize()
 
         # Example: Force sum-based reduction for custom communication backend
         # (some backends like xccl don't support ReduceOp.AVG)
-        if hasattr(self.model, "set_force_sum_reduction_for_comms"):
-            self.model.set_force_sum_reduction_for_comms(True)
+        if hasattr(self.module, "set_force_sum_reduction_for_comms"):
+            self.module.set_force_sum_reduction_for_comms(True)
             logger.info("Enabled force_sum_reduction for MyVendor comm backend")
 
 
@@ -607,8 +613,8 @@ class FSDPMyVendorEngineWithValueHead(FSDPEngineWithValueHead):
 
     def initialize(self):
         super().initialize()
-        if hasattr(self.model, "set_force_sum_reduction_for_comms"):
-            self.model.set_force_sum_reduction_for_comms(True)
+        if hasattr(self.module, "set_force_sum_reduction_for_comms"):
+            self.module.set_force_sum_reduction_for_comms(True)
 ```
 
 Then register in `verl_hardware_plugin/engines/__init__.py`:
@@ -730,8 +736,8 @@ And the corresponding engine:
 class FSDPXPUEngineWithLMHead(FSDPEngineWithLMHead):
     def initialize(self):
         super().initialize()
-        if hasattr(self.model, "set_force_sum_reduction_for_comms"):
-            self.model.set_force_sum_reduction_for_comms(True)
+        if hasattr(self.module, "set_force_sum_reduction_for_comms"):
+            self.module.set_force_sum_reduction_for_comms(True)
 ```
 
 ---
@@ -849,7 +855,7 @@ Environment variable overrides:
 
 **Solution**: In your engine's `initialize()`, enable force sum reduction:
 ```python
-self.model.set_force_sum_reduction_for_comms(True)
+self.module.set_force_sum_reduction_for_comms(True)
 ```
 
 ### Problem: Import errors when plugin is installed on machines without my hardware
