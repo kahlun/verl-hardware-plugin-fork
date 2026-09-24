@@ -18,6 +18,14 @@ def apply_mlu_profiler_patches():
     _patch_get_torch_profiler()
 
 
+def apply_xpu_profiler_patches():
+    """Apply all XPU profiler monkey-patches. Idempotent."""
+    from .torch_profile_xpu import _patch_get_torch_profiler, _patch_tool_config
+
+    _patch_tool_config()
+    _patch_get_torch_profiler()
+
+
 def register_all_profiles():
     """Register all profiler extensions.
 
@@ -30,3 +38,9 @@ def register_all_profiles():
         logger.info("Registered profiler: mlu")
     except Exception as e:
         logger.debug("MLU profiler patches not registered: %s", e)
+
+    try:
+        apply_xpu_profiler_patches()
+        logger.info("Registered profiler: xpu")
+    except Exception as e:
+        logger.debug("XPU profiler patches not registered: %s", e)
