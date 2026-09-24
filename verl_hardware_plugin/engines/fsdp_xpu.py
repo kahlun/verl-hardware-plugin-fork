@@ -13,6 +13,21 @@ Why is this engine needed?
     followed by manual division, which is functionally equivalent but
     compatible with xccl.
 
+Why not patch verl-core's apply_fsdp2() instead?
+    verl/workers/engine/fsdp/transformer_impl.py does
+    `from verl.utils.fsdp_utils import apply_fsdp2` at its own import time, so a
+    plugin that reassigns `verl.utils.fsdp_utils.apply_fsdp2` after that module
+    has already imported the name would have no effect on this call site --
+    the same import-order fragility as verl core's profiler-marker dispatch
+    (see docs/design/ for that one). This engine sidesteps the problem
+    entirely: it does not patch anything. It calls
+    set_force_sum_reduction_for_comms() on the already-constructed model
+    *after* super().initialize() (which internally calls the real
+    apply_fsdp2()) returns, from inside the plugin's own EngineRegistry
+    subclass. That is ordinary method-override behavior, not a monkeypatch,
+    so it is robust regardless of when/how anything else imported
+    apply_fsdp2.
+
 Registration:
     @EngineRegistry.register(device="xpu", vendor="intel")
     This means verl will automatically select this engine when:
@@ -38,6 +53,28 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _force_sum_reduction_on_all_fsdp_modules(root) -> None:
+    """Apply set_force_sum_reduction_for_comms(True) to root and every nested
+    FSDP2-wrapped submodule, not just the root.
+
+    fully_shard() wraps the transformer layers individually as well as the
+    root model (verl/utils/fsdp_utils.py::apply_fsdp2), so each of those
+    per-layer wrappers has its own communication group that also defaults to
+    ReduceOp.AVG. Only fixing the root leaves per-layer gradient sync using
+    AVG, which xccl silently cannot execute correctly.
+    """
+    if hasattr(root, "set_force_sum_reduction_for_comms"):
+        root.set_force_sum_reduction_for_comms(True)
+    count = 1
+    for submodule in root.modules():
+        if submodule is root:
+            continue
+        if hasattr(submodule, "set_force_sum_reduction_for_comms"):
+            submodule.set_force_sum_reduction_for_comms(True)
+            count += 1
+    logger.info("Enabled force_sum_reduction_for_comms on %d FSDP module(s) for XPU", count)
+
+
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device="xpu", vendor="intel")
 class FSDPXPUEngineWithLMHead(FSDPEngineWithLMHead):
     """FSDP Engine for Intel XPU with xccl communication backend.
@@ -59,15 +96,14 @@ class FSDPXPUEngineWithLMHead(FSDPEngineWithLMHead):
     def initialize(self):
         """Initialize the FSDP model, then apply XPU-specific workarounds.
 
-        The key workaround: force sum-based gradient reduction.
-        This is needed because xccl does not support ReduceOp.AVG.
-        The FSDP wrapper will use SUM + manual division instead.
+        The key workaround: force sum-based gradient reduction, root module
+        and every per-layer FSDP2 wrapper. This is needed because xccl does
+        not support ReduceOp.AVG. The FSDP wrapper will use SUM + manual
+        division instead.
         """
         super().initialize()
         # xccl does not support ReduceOp.AVG; force sum-based reduction
-        if hasattr(self.model, "set_force_sum_reduction_for_comms"):
-            self.model.set_force_sum_reduction_for_comms(True)
-            logger.info("Enabled force_sum_reduction_for_comms for XPU")
+        _force_sum_reduction_on_all_fsdp_modules(self.module)
 
 
 @EngineRegistry.register(model_type="value_model", backend=["fsdp", "fsdp2"], device="xpu", vendor="intel")
@@ -91,5 +127,4 @@ class FSDPXPUEngineWithValueHead(FSDPEngineWithValueHead):
     def initialize(self):
         """Initialize the FSDP value model, then apply xccl workaround."""
         super().initialize()
-        if hasattr(self.model, "set_force_sum_reduction_for_comms"):
-            self.model.set_force_sum_reduction_for_comms(True)
+        _force_sum_reduction_on_all_fsdp_modules(self.module)
