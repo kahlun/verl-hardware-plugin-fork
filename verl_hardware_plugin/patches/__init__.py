@@ -17,6 +17,11 @@ check in ``_xpu_guard`` and sets its own ``_applied`` flag, so apply_all() is
 idempotent and importing this package is safe even when another vendor's
 plugin (or no accelerator at all) is active in the same process.
 
+``numa_affinity_patch_xpu`` is deliberately NOT applied here. It is applied
+from ``PlatformXPU.__init__``, i.e. only once verl has selected XPU for this
+process, so a host where another platform is selected never has
+``set_numa_affinity`` touched.
+
 Failure handling
     On a non-XPU process there is nothing to install, so a failure is not
     interesting and is logged at debug. On an XPU process a patch that fails
