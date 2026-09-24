@@ -266,7 +266,7 @@ def _rebind_importers(original, replacement) -> None:
     for name in _IMPORTERS:
         module = sys.modules.get(name)
         if module is not None and getattr(module, "set_numa_affinity", None) is original:
-            module.set_numa_affinity = replacement
+            setattr(module, "set_numa_affinity", replacement)  # noqa: B010
             logger.info("[verl_hardware_plugin] Rebound set_numa_affinity in already-imported %s", name)
 
 

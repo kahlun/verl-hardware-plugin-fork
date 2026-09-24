@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 BAAI. All rights reserved.
+# Licensed under the Apache License, Version 2.0.
 """On-hardware verification for patches/numa_affinity_patch_xpu.py.
 
 The unit tests prove the patch logic against a stubbed verl. They cannot prove
