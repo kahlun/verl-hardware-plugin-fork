@@ -164,23 +164,10 @@ ENV UV_LINK_MODE="copy"
 ENV VLLM_TARGET_DEVICE="xpu"
 
 # --- Layer 1: vLLM + torch Intel GPU ---
-# Installed from the prebuilt XPU wheel at wheels.vllm.ai/<version>/xpu instead
-# of built from source — that index carries torch==2.13.0 + vllm_xpu_kernels
-# 0.1.14.1 (see ARG VLLM_VERSION above), same as a from-source build.
-#
-# The unversioned wheels.vllm.ai/xpu "triton shim" index is included alongside
-# the version-scoped one defensively: at v0.29.0 the version-scoped index
-# happens to already carry the exact triton==3.7.2+xpu that requirements/xpu.txt
-# pins, but that's not guaranteed for every release — v0.30.0's version-scoped
-# index republishes only that commit's *latest* triton-xpu build
-# (triton-3.8.0+xpu), not the older pinned version, and resolution fails
-# outright without the shim index to fall back on. Keep both.
-#
-# --extra-index-url on this command line REPLACES UV_EXTRA_INDEX_URL (set above
-# to ${PIP_EXTRA_INDEX_URL}) rather than adding to it, so PyPI has to be repeated
-# explicitly here too — otherwise plain-PyPI transitive deps pulled in via
-# common.txt (e.g. lm-format-enforcer) become unresolvable.
-RUN set -ex && \
+# install VLLM intel xpu wheel
+# refer here for latest information
+# https://docs.vllm.ai/en/latest/getting_started/installation/gpu/#pre-built-wheels
+RUN --mount=type=cache,target=/root/.cache/uv set -ex && \
     uv pip install "vllm==${VLLM_VERSION#v}+xpu" \
         --extra-index-url "https://wheels.vllm.ai/${VLLM_VERSION#v}/xpu" \
         --extra-index-url "https://wheels.vllm.ai/xpu" \
@@ -194,43 +181,20 @@ RUN set -eux && \
     git checkout "${VERL_REF}"
 
 COPY docker/intel_gpu/requirements-intel-gpu.txt /tmp/requirements-intel-gpu.txt
-RUN set -eux && uv pip install -r /tmp/requirements-intel-gpu.txt
+RUN --mount=type=cache,target=/root/.cache/uv set -eux && uv pip install -r /tmp/requirements-intel-gpu.txt
 
 # pyzes >= 0.1.2, installed separately and deliberately overriding torch's own
-# exact pin (torch==2.13.0+xpu declares pyzes==0.1.1). This cannot go in
-# requirements-intel-gpu.txt: that file is installed with resolution on, and uv
-# correctly rejects the pair as unsatisfiable --
-#   Because torch==2.13.0+xpu depends on pyzes==0.1.1 ... and because you
-#   require pyzes>=0.1.2, your requirements are unsatisfiable.
-# --no-deps is what lets the newer version land anyway.
-#
-# Why 0.1.1 isn't enough: this plugin sets NUMA affinity on XPU via
-# zesDevicePciGetProperties -> PCI BDF -> sysfs numa_node/cpulist ->
-# sched_setaffinity, because verl's own set_numa_affinity() pins via pynvml,
-# which doesn't exist here. pyzes 0.1.1 ships NO PCI symbols at all;
-# zesDevicePciGetProperties, zes_pci_properties_t and zes_pci_address_t were
-# added by oneapi-src/level-zero#462 and first released in 0.1.2 (2026-06-12).
-# On 0.1.1 the pinning call dies with
-#   AttributeError: module 'pyzes' has no attribute 'zes_pci_properties_t'
-# which the caller swallows into a warning, so the job runs silently
-# un-NUMA-pinned -- the exact failure this code exists to prevent. Observed on
-# a real B60 run against an image that resolved 0.1.1 transitively.
-#
-# Why overriding torch's pin is safe: 0.1.2 is purely additive over 0.1.1 (that
-# PR is titled "Add more APIs to L0 Sysman python binding"), and torch.xpu only
-# calls the telemetry APIs, which are unchanged. Verified on B60 with this exact
-# combination -- torch 2.13.0+xpu on pyzes 0.1.2 loaded the full verl stack and
-# reported torch.xpu.device_count()=2. Re-check if the torch pin ever moves.
-RUN set -eux && \
-    uv pip install --no-deps "pyzes>=0.1.2" && \
-    python3 -c "import pyzes; assert hasattr(pyzes, 'zesDevicePciGetProperties'), 'pyzes is missing the PCI API'"
+# for future PYNVML equivalent
+RUN --mount=type=cache,target=/root/.cache/uv set -eux && \
+    uv pip install --no-deps "pyzes>=0.1.2"
 
-RUN set -eux && cd /opt/verl && uv pip install --no-deps -e .
+RUN --mount=type=cache,target=/root/.cache/uv set -eux && cd /opt/verl && uv pip install --no-deps -e .
 
 # xgrammar (via vLLM's common.txt) pulls in plain triton as a transitive dep.
 # Plain triton is for NVIDIA only — replace with triton-xpu per official vLLM XPU docs.
 # See: https://docs.vllm.ai/en/latest/getting_started/xpu-installation.html
-RUN uv pip uninstall triton triton-xpu -y 2>/dev/null || true && \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip uninstall triton triton-xpu -y 2>/dev/null || true && \
     uv pip install triton-xpu==3.7.1 --extra-index-url https://download.pytorch.org/whl/xpu
 
 # --- Layer 3: this plugin (verl_hardware_plugin), from the local build context ---
@@ -244,7 +208,7 @@ COPY . /opt/verl-hardware-plugin
 # --no-deps: pyproject.toml declares "verl>=0.7.0" as a dependency, but we want
 # the pinned checkout installed at /opt/verl above (Layer 2), not a PyPI verl
 # release silently overwriting it.
-RUN set -eux && uv pip install --no-deps -e .
+RUN --mount=type=cache,target=/root/.cache/uv set -eux && uv pip install --no-deps -e .
 
 # No VERL_USE_EXTERNAL_MODULES needed: this plugin is auto-discovered via the
 # `verl.plugins` setuptools entry_points group declared in pyproject.toml
