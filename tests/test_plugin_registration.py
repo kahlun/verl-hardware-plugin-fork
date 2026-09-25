@@ -689,5 +689,148 @@ class TestMayEnableFlagGems:
                         may_enable_flag_gems(phase="training")
 
 
+class TestReduceAvgPatchWiring:
+    """The reduce_avg monkeypatch must fire on platform *selection*, not on
+    mere XPU hardware/SDK *presence*.
+
+    verl.plugin.platform.platform_manager._create_platform() only constructs
+    PlatformXPU() once platform detection (VERL_PLATFORM=intel, or
+    auto-detection) has actually picked "intel" for this process. Applying
+    the patch from the shared verl_hardware_plugin/__init__.py instead would
+    fire on any host where XPU merely happens to be importable, even when a
+    different platform is selected for the run -- e.g. VERL_PLATFORM=nvidia
+    explicitly set on a mixed host would still get its process-wide
+    torch.distributed.all_reduce(op=AVG) semantics changed for no reason.
+    """
+
+    def test_platform_xpu_init_applies_patches(self):
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        with mock.patch("verl_hardware_plugin.patches.reduce_avg_allreduce_patch_xpu.apply") as fake_apply:
+            PlatformXPU()
+
+        fake_apply.assert_called_once()
+
+    def test_plugin_init_does_not_bind_reduce_avg_patch(self):
+        import verl_hardware_plugin
+
+        assert not hasattr(verl_hardware_plugin, "apply_all_patches")
+        assert not hasattr(verl_hardware_plugin, "reduce_avg_allreduce_patch_xpu")
+
+
+class TestReduceAvgAllReducePatch:
+    """torch.distributed.all_reduce(op=AVG) -> SUM + manual divide, scoped to
+    xccl process groups only -- a gloo/nccl group in the same process (e.g. a
+    CPU-only Ray actor's coordination group) must keep native AVG.
+
+    _applied is process-global module state (the same property that makes
+    this patch risky in production -- see the module's own docstring), so
+    each test must save/restore torch.distributed.all_reduce and reset the
+    flag, or tests would leak into each other.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_patch_state(self):
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+
+        original_all_reduce = dist.all_reduce
+        patch_mod._applied = False
+        yield
+        dist.all_reduce = original_all_reduce
+        patch_mod._applied = False
+
+    def test_noop_when_xpu_unavailable(self):
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+
+        before = dist.all_reduce
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=False):
+            patch_mod.apply()
+
+        assert dist.all_reduce is before
+
+    def test_avg_becomes_sum_plus_divide(self):
+        import torch
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+
+        fake_original = mock.MagicMock()
+        tensor = torch.tensor([4.0])
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
+            with mock.patch.object(dist, "all_reduce", fake_original):
+                patch_mod.apply()
+                patched = dist.all_reduce
+                assert patched is not fake_original
+
+                with mock.patch.object(dist, "get_backend", return_value="xccl"):
+                    with mock.patch.object(dist, "get_world_size", return_value=4):
+                        patched(tensor, op=dist.ReduceOp.AVG)
+
+        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False)
+        assert tensor.item() == 1.0
+
+    def test_non_xccl_backend_passes_through_even_with_avg(self):
+        """A gloo/nccl group in the same process must keep native AVG untouched."""
+        import torch
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+
+        fake_original = mock.MagicMock()
+        tensor = torch.tensor([4.0])
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
+            with mock.patch.object(dist, "all_reduce", fake_original):
+                patch_mod.apply()
+                with mock.patch.object(dist, "get_backend", return_value="gloo"):
+                    dist.all_reduce(tensor, op=dist.ReduceOp.AVG, group="cpu_group")
+
+        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.AVG, group="cpu_group", async_op=False)
+
+    def test_non_avg_op_passes_through_unchanged(self):
+        import torch
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+
+        fake_original = mock.MagicMock()
+        tensor = torch.tensor([4.0])
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
+            with mock.patch.object(dist, "all_reduce", fake_original):
+                patch_mod.apply()
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group="g")
+
+        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.SUM, group="g", async_op=False)
+
+    def test_async_avg_falls_through_unpatched(self):
+        import torch
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+
+        fake_original = mock.MagicMock()
+        tensor = torch.tensor([4.0])
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
+            with mock.patch.object(dist, "all_reduce", fake_original):
+                patch_mod.apply()
+                dist.all_reduce(tensor, op=dist.ReduceOp.AVG, async_op=True)
+
+        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.AVG, group=None, async_op=True)
+
+    def test_idempotent(self):
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
+            patch_mod.apply()
+            patched_once = dist.all_reduce
+            patch_mod.apply()
+            assert dist.all_reduce is patched_once
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
