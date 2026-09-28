@@ -706,7 +706,7 @@ class TestReduceAvgPatchWiring:
     def test_platform_xpu_init_applies_patches(self):
         from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
 
-        with mock.patch("verl_hardware_plugin.patches.reduce_avg_allreduce_patch_xpu.apply") as fake_apply:
+        with mock.patch("verl_hardware_plugin.patches.xpu.reduce_avg_allreduce_patch.apply") as fake_apply:
             PlatformXPU()
 
         fake_apply.assert_called_once()
@@ -733,7 +733,7 @@ class TestReduceAvgAllReducePatch:
     def _reset_patch_state(self):
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
 
         original_all_reduce = dist.all_reduce
         patch_mod._applied = False
@@ -744,7 +744,7 @@ class TestReduceAvgAllReducePatch:
     def test_noop_when_xpu_unavailable(self):
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
 
         before = dist.all_reduce
         with mock.patch.object(patch_mod, "_xpu_available", return_value=False):
@@ -756,7 +756,7 @@ class TestReduceAvgAllReducePatch:
         import torch
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
 
         fake_original = mock.MagicMock()
         tensor = torch.tensor([4.0])
@@ -778,7 +778,7 @@ class TestReduceAvgAllReducePatch:
         import torch
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
 
         fake_original = mock.MagicMock()
         tensor = torch.tensor([4.0])
@@ -794,7 +794,7 @@ class TestReduceAvgAllReducePatch:
         import torch
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
 
         fake_original = mock.MagicMock()
         tensor = torch.tensor([4.0])
@@ -809,7 +809,7 @@ class TestReduceAvgAllReducePatch:
         import torch
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
 
         fake_original = mock.MagicMock()
         tensor = torch.tensor([4.0])
@@ -823,7 +823,7 @@ class TestReduceAvgAllReducePatch:
     def test_idempotent(self):
         import torch.distributed as dist
 
-        from verl_hardware_plugin.patches import reduce_avg_allreduce_patch_xpu as patch_mod
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
 
         with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
             patch_mod.apply()

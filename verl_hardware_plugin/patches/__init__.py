@@ -12,9 +12,9 @@ Applying a patch from a shared location instead would fire on any host where
 the corresponding hardware/SDK merely happens to be importable, regardless of
 which platform verl actually selects for the run.
 
-Currently contains one module:
+Currently contains one platform subpackage:
 
-- `reduce_avg_allreduce_patch_xpu`: Intel XPU's `is_reduce_avg_supported`
+- `xpu.reduce_avg_allreduce_patch`: Intel XPU's `is_reduce_avg_supported`
   replacement. See its own docstring for what it does and why it's a
   monkeypatch rather than a `PlatformBase` hook (verl-hardware-plugin#26).
 """
