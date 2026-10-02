@@ -202,6 +202,14 @@ class PlatformXPU(PlatformBase):
         # assignment manually to support multi-GPU-per-actor configurations
         return ["RAY_EXPERIMENTAL_NOSET_ZE_AFFINITY_MASK"]
 
+    def ray_device_index(self, accelerator_ids: list[str]) -> int:
+        # torch-xpu discards ZE_AFFINITY_MASK once its lazy init runs, so every
+        # actor still enumerates all devices and xpu:N is physical device N
+        # regardless of the mask. Pin the physical id Ray assigned; the base
+        # implementation's mask-relative index would put every rank on xpu:0.
+        # Only called by verl-core that has PlatformBase.ray_device_index().
+        return int(accelerator_ids[0])
+
     # ------------------------------------------------------------------
     # IPC support
     # ------------------------------------------------------------------
