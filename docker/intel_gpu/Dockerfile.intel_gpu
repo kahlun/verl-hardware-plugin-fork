@@ -88,14 +88,13 @@ ARG IGDGMM_VERSION=22.10.0
 ARG LEVEL_ZERO_VERSION=1.28.2+u24.04
 
 # verl-core, pulled in at a pinned ref — NOT the local build context (that's
-# this plugin, see Layer 3). Until verl-project/verl#7917 (the PlatformBase
-# hooks is_reduce_avg_supported()/attention_utils_module()/profiler_markers()/
-# dist_profiler_cls() that this plugin's platform_xpu.py and profilers/
-# override) merges upstream, default to the fork+branch that actually has
-# them. Switch VERL_GIT_REPO to https://github.com/verl-project/verl.git and
-# VERL_REF to a released tag once #7917 lands.
+# this plugin, see Layer 3). xpu-core-upstream is upstream verl main plus two
+# not-yet-upstream fixes: Ray worker device pinning (without it every rank lands
+# on xpu:0 under multi-GPU) and mutable max_num_batched_tokens (verl#8075).
+# Switch VERL_GIT_REPO to https://github.com/verl-project/verl.git and VERL_REF
+# to a released tag once both land upstream.
 ARG VERL_GIT_REPO=https://github.com/kahlun/verl.git
-ARG VERL_REF=intel-xpu-plugin-e2e-vllm
+ARG VERL_REF=xpu-core-upstream
 
 WORKDIR /workspace
 
