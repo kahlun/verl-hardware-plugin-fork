@@ -748,57 +748,44 @@ class TestXPUCollectiveModule:
         assert callable(module.get_unique_id)
         assert callable(module.NcclCommunicator)
 
-    def test_get_unique_id_returns_host_and_port_not_a_byte_blob(self):
+    def test_get_unique_id_returns_a_free_port_not_a_byte_blob(self):
         from verl_hardware_plugin.collectives import xccl_collective_xpu
 
-        with (
-            mock.patch("torch.distributed.TCPStore") as fake_store,
-            mock.patch("ray.util.get_node_ip_address", return_value="10.0.0.5"),
-        ):
-            fake_store.return_value.port = 12345
-            result = xccl_collective_xpu.get_unique_id()
+        with mock.patch("ray.util.get_node_ip_address", return_value="127.0.0.1"):
+            host, port = xccl_collective_xpu.get_unique_id()
 
-        assert result == ("10.0.0.5", 12345)
-        fake_store.assert_called_once_with(host_name="0.0.0.0", port=0, is_master=True, use_libuv=True)
+        assert host == "127.0.0.1"
+        assert isinstance(port, int) and port > 0
 
-    def test_rank_zero_reuses_the_store_it_just_started(self):
+    def test_constructor_calls_init_process_group_with_hybrid_backend(self):
         from verl_hardware_plugin.collectives import xccl_collective_xpu
 
-        with (
-            mock.patch("torch.distributed.TCPStore") as fake_store,
-            mock.patch("ray.util.get_node_ip_address", return_value="10.0.0.5"),
-        ):
-            fake_store.return_value.port = 12345
-            comm_id = xccl_collective_xpu.get_unique_id()
-
-            with mock.patch("torch._C._distributed_c10d.ProcessGroupXCCL"):
-                xccl_collective_xpu.NcclCommunicator(ndev=2, commId=comm_id, rank=0)
-
-            # get_unique_id() started the store; rank 0's communicator must reuse
-            # it rather than opening a second TCPStore pointed at its own id.
-            fake_store.assert_called_once()
-
-    def test_nonzero_rank_connects_as_client_to_rank_zeros_store(self):
-        from verl_hardware_plugin.collectives import xccl_collective_xpu
-
-        with (
-            mock.patch("torch.distributed.TCPStore") as fake_store,
-            mock.patch("torch._C._distributed_c10d.ProcessGroupXCCL"),
-        ):
+        with mock.patch("torch.distributed.init_process_group") as fake_init:
             xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
 
-        fake_store.assert_called_once_with(host_name="10.0.0.5", port=12345, is_master=False)
+        # Pure XCCL (no gloo half) hangs on 2-card Battlemage (PTF1-99) -- the
+        # hybrid backend string is the entire point of this shim, not incidental.
+        fake_init.assert_called_once_with(
+            backend="cpu:gloo,xpu:xccl",
+            init_method="tcp://10.0.0.5:12345",
+            rank=1,
+            world_size=2,
+        )
 
     def test_rank_id_reports_constructor_rank(self):
         from verl_hardware_plugin.collectives import xccl_collective_xpu
 
-        with (
-            mock.patch("torch.distributed.TCPStore"),
-            mock.patch("torch._C._distributed_c10d.ProcessGroupXCCL"),
-        ):
+        with mock.patch("torch.distributed.init_process_group"):
             comm = xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
 
         assert comm.rank_id() == 1
+
+    def test_pg_property_is_the_default_world_group(self):
+        from verl_hardware_plugin.collectives import xccl_collective_xpu
+
+        with mock.patch("torch.distributed.init_process_group"), mock.patch("torch.distributed.group") as fake_group:
+            comm = xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
+            assert comm._pg is fake_group.WORLD
 
 
 class TestReduceAvgPatchWiring:

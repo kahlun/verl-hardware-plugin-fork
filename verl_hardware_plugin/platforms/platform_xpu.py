@@ -264,8 +264,9 @@ class PlatformXPU(PlatformBase):
 
     def get_collective_module(self) -> Any:
         # No cupy-style raw comm-id primitive exists for XCCL; this shim
-        # bootstraps ProcessGroupXCCL from a TCPStore instead. See
-        # xccl_collective_xpu.py for why get_unique_id()/NcclCommunicator()
+        # bootstraps a hybrid cpu:gloo,xpu:xccl torch.distributed process
+        # group instead -- pure XCCL hangs on 2-card Battlemage (PTF1-99).
+        # See xccl_collective_xpu.py for why get_unique_id()/NcclCommunicator()
         # carry (host, port) rather than a NCCL unique-id blob.
         from verl_hardware_plugin.collectives import xccl_collective_xpu
 

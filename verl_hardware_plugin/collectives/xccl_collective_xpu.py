@@ -6,43 +6,52 @@
 verl.utils.rendezvous.ray_backend's create_nccl_communicator_in_ray() expects
 a module shaped like cupy.cuda.nccl: a module-level get_unique_id() (called
 once, by rank 0, before any communicator exists) and a
-NcclCommunicator(ndev, commId, rank) class. NCCL's unique id is an opaque
-byte blob with no listener behind it. XCCL has no such primitive --
-torch's ProcessGroupXCCL is bootstrapped from a live TCPStore server
-instead. So get_unique_id() here doubles as "start the TCPStore server",
-and commId carries (host, port) rather than a byte blob.
+NcclCommunicator(ndev, commId, rank) class.
+
+A pure XCCL process group (torch._C._distributed_c10d.ProcessGroupXCCL built
+directly off a TCPStore) hangs during construction/collectives on 2-card
+Battlemage (Intel Jira PTF1-99) -- reproduced on real 2x B60 hardware,
+3 separate runs, including with a device-pinning fix applied; the process
+core-dumps when killed on timeout. Pairing the device group with a gloo CPU
+group avoids that path, so this shim bootstraps a torch.distributed process
+group with backend="cpu:gloo,xpu:xccl" instead of constructing ProcessGroupXCCL
+directly. get_unique_id() only reserves a (host, port) pair; the TCPStore
+itself is created internally by init_process_group()'s own tcp:// rendezvous,
+not by this module.
 """
 
-import torch
-import torch.distributed as dist
+import socket
 
-_pending_store = None
+import torch.distributed as dist
 
 
 def get_unique_id():
-    global _pending_store
-    _pending_store = dist.TCPStore(host_name="0.0.0.0", port=0, is_master=True, use_libuv=True)
     import ray
 
     host = ray.util.get_node_ip_address()
-    return (host, _pending_store.port)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        port = s.getsockname()[1]
+    return (host, port)
 
 
 class NcclCommunicator:
-    """Shape-compatible stand-in for cupy.cuda.nccl.NcclCommunicator, backed by XCCL."""
+    """Shape-compatible stand-in for cupy.cuda.nccl.NcclCommunicator, backed by a
+    hybrid cpu:gloo,xpu:xccl torch.distributed process group."""
 
     def __init__(self, ndev, commId, rank):
-        global _pending_store
         host, port = commId
-        if rank == 0 and _pending_store is not None:
-            store = _pending_store
-        else:
-            store = dist.TCPStore(host_name=host, port=port, is_master=False)
-        _pending_store = None
-
-        c10d = torch._C._distributed_c10d
-        self._pg = c10d.ProcessGroupXCCL(store, rank, ndev)
+        dist.init_process_group(
+            backend="cpu:gloo,xpu:xccl",
+            init_method=f"tcp://{host}:{port}",
+            rank=rank,
+            world_size=ndev,
+        )
         self._rank = rank
 
     def rank_id(self) -> int:
         return self._rank
+
+    @property
+    def _pg(self):
+        return dist.group.WORLD
