@@ -730,6 +730,77 @@ class TestXPURayDeviceIndex:
             assert platform.ray_device_index(["3"]) == 3
 
 
+class TestXPUCollectiveModule:
+    """get_collective_module() must return the cupy.cuda.nccl-shaped XCCL shim.
+
+    verl.utils.rendezvous.ray_backend.create_nccl_communicator_in_ray() calls
+    collective.get_unique_id() and collective.NcclCommunicator(ndev, commId, rank)
+    on whatever get_collective_module() returns; it has no XPU-specific code of
+    its own, so the shim's shape is the entire contract.
+    """
+
+    def test_returns_module_with_nccl_shaped_api(self):
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        platform = PlatformXPU.__new__(PlatformXPU)
+        module = platform.get_collective_module()
+
+        assert callable(module.get_unique_id)
+        assert callable(module.NcclCommunicator)
+
+    def test_get_unique_id_returns_host_and_port_not_a_byte_blob(self):
+        from verl_hardware_plugin.collectives import xccl_collective_xpu
+
+        with (
+            mock.patch("torch.distributed.TCPStore") as fake_store,
+            mock.patch("ray.util.get_node_ip_address", return_value="10.0.0.5"),
+        ):
+            fake_store.return_value.port = 12345
+            result = xccl_collective_xpu.get_unique_id()
+
+        assert result == ("10.0.0.5", 12345)
+        fake_store.assert_called_once_with(host_name="0.0.0.0", port=0, is_master=True, use_libuv=True)
+
+    def test_rank_zero_reuses_the_store_it_just_started(self):
+        from verl_hardware_plugin.collectives import xccl_collective_xpu
+
+        with (
+            mock.patch("torch.distributed.TCPStore") as fake_store,
+            mock.patch("ray.util.get_node_ip_address", return_value="10.0.0.5"),
+        ):
+            fake_store.return_value.port = 12345
+            comm_id = xccl_collective_xpu.get_unique_id()
+
+            with mock.patch("torch._C._distributed_c10d.ProcessGroupXCCL"):
+                xccl_collective_xpu.NcclCommunicator(ndev=2, commId=comm_id, rank=0)
+
+            # get_unique_id() started the store; rank 0's communicator must reuse
+            # it rather than opening a second TCPStore pointed at its own id.
+            fake_store.assert_called_once()
+
+    def test_nonzero_rank_connects_as_client_to_rank_zeros_store(self):
+        from verl_hardware_plugin.collectives import xccl_collective_xpu
+
+        with (
+            mock.patch("torch.distributed.TCPStore") as fake_store,
+            mock.patch("torch._C._distributed_c10d.ProcessGroupXCCL"),
+        ):
+            xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
+
+        fake_store.assert_called_once_with(host_name="10.0.0.5", port=12345, is_master=False)
+
+    def test_rank_id_reports_constructor_rank(self):
+        from verl_hardware_plugin.collectives import xccl_collective_xpu
+
+        with (
+            mock.patch("torch.distributed.TCPStore"),
+            mock.patch("torch._C._distributed_c10d.ProcessGroupXCCL"),
+        ):
+            comm = xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
+
+        assert comm.rank_id() == 1
+
+
 class TestReduceAvgPatchWiring:
     """The reduce_avg monkeypatch must fire on platform *selection*, not on
     mere XPU hardware/SDK *presence*.

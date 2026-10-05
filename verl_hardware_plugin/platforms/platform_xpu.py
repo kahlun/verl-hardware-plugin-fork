@@ -263,9 +263,13 @@ class PlatformXPU(PlatformBase):
     # ------------------------------------------------------------------
 
     def get_collective_module(self) -> Any:
-        # Intel XPU does not expose a Python-level collective communication
-        # module like cupy.cuda.nccl. Return None to indicate unavailability.
-        return None
+        # No cupy-style raw comm-id primitive exists for XCCL; this shim
+        # bootstraps ProcessGroupXCCL from a TCPStore instead. See
+        # xccl_collective_xpu.py for why get_unique_id()/NcclCommunicator()
+        # carry (host, port) rather than a NCCL unique-id blob.
+        from verl_hardware_plugin.collectives import xccl_collective_xpu
+
+        return xccl_collective_xpu
 
     # ------------------------------------------------------------------
     # Low-level runtime API
