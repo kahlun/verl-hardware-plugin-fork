@@ -13,6 +13,7 @@ user_guide_xpu/
 ├── README.md              # This file
 ├── install_guidance.md    # Installation guide
 ├── quick_start.md         # Quick start
+├── profiling.md           # Profiling guide
 └── faq.md                 # FAQ and troubleshooting
 ```
 
@@ -20,6 +21,7 @@ user_guide_xpu/
 
 - [Installation Guide](./install_guidance.md)
 - [Quick Start](./quick_start.md)
+- [Profiling Guide](./profiling.md) — Use community torch profile on XPU
 - [FAQ](./faq.md)
 
 ## Platform Summary
