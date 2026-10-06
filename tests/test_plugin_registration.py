@@ -730,6 +730,62 @@ class TestXPURayDeviceIndex:
             assert platform.ray_device_index(["3"]) == 3
 
 
+class TestXPUCollectiveModule:
+    """get_collective_module() must return the cupy.cuda.nccl-shaped XCCL shim.
+
+    verl.utils.rendezvous.ray_backend.create_nccl_communicator_in_ray() calls
+    collective.get_unique_id() and collective.NcclCommunicator(ndev, commId, rank)
+    on whatever get_collective_module() returns; it has no XPU-specific code of
+    its own, so the shim's shape is the entire contract.
+    """
+
+    def test_returns_module_with_nccl_shaped_api(self):
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        platform = PlatformXPU.__new__(PlatformXPU)
+        module = platform.get_collective_module()
+
+        assert callable(module.get_unique_id)
+        assert callable(module.NcclCommunicator)
+
+    def test_get_unique_id_returns_a_free_port_not_a_byte_blob(self):
+        from verl_hardware_plugin.collectives import xccl_collective_xpu
+
+        with mock.patch("ray.util.get_node_ip_address", return_value="127.0.0.1"):
+            host, port = xccl_collective_xpu.get_unique_id()
+
+        assert host == "127.0.0.1"
+        assert isinstance(port, int) and port > 0
+
+    def test_constructor_calls_init_process_group_with_hybrid_backend(self):
+        from verl_hardware_plugin.collectives import xccl_collective_xpu
+
+        with mock.patch("torch.distributed.init_process_group") as fake_init:
+            xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
+
+        fake_init.assert_called_once_with(
+            backend="cpu:gloo,xpu:xccl",
+            init_method="tcp://10.0.0.5:12345",
+            rank=1,
+            world_size=2,
+        )
+
+    def test_rank_id_reports_constructor_rank(self):
+        from verl_hardware_plugin.collectives import xccl_collective_xpu
+
+        with mock.patch("torch.distributed.init_process_group"):
+            comm = xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
+
+        assert comm.rank_id() == 1
+
+    def test_pg_property_is_the_default_world_group(self):
+        from verl_hardware_plugin.collectives import xccl_collective_xpu
+
+        with mock.patch("torch.distributed.init_process_group"), mock.patch("torch.distributed.group") as fake_group:
+            comm = xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
+            assert comm._pg is fake_group.WORLD
+
+
 class TestReduceAvgPatchWiring:
     """The reduce_avg monkeypatch must fire on platform *selection*, not on
     mere XPU hardware/SDK *presence*.
