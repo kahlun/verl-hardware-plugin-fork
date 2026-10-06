@@ -763,8 +763,6 @@ class TestXPUCollectiveModule:
         with mock.patch("torch.distributed.init_process_group") as fake_init:
             xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
 
-        # Pure XCCL (no gloo half) hangs on 2-card Battlemage (PTF1-99) -- the
-        # hybrid backend string is the entire point of this shim, not incidental.
         fake_init.assert_called_once_with(
             backend="cpu:gloo,xpu:xccl",
             init_method="tcp://10.0.0.5:12345",

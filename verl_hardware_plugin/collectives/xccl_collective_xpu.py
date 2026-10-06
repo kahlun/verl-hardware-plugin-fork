@@ -8,14 +8,9 @@ a module shaped like cupy.cuda.nccl: a module-level get_unique_id() (called
 once, by rank 0, before any communicator exists) and a
 NcclCommunicator(ndev, commId, rank) class.
 
-A pure XCCL process group (torch._C._distributed_c10d.ProcessGroupXCCL built
-directly off a TCPStore) hangs during construction/collectives on 2-card
-Battlemage (Intel Jira PTF1-99) -- reproduced on real 2x B60 hardware,
-3 separate runs, including with a device-pinning fix applied; the process
-core-dumps when killed on timeout. Pairing the device group with a gloo CPU
-group avoids that path, so this shim bootstraps a torch.distributed process
-group with backend="cpu:gloo,xpu:xccl" instead of constructing ProcessGroupXCCL
-directly. get_unique_id() only reserves a (host, port) pair; the TCPStore
+XCCL has no raw unique-id primitive, so this shim bootstraps a
+torch.distributed process group with backend="cpu:gloo,xpu:xccl" instead.
+get_unique_id() only reserves a (host, port) pair; the TCPStore
 itself is created internally by init_process_group()'s own tcp:// rendezvous,
 not by this module.
 """
