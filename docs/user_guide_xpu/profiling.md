@@ -1,6 +1,6 @@
 # Intel VTune Profiling Guide
 
-Last updated: 09/22/2026.
+Last updated: 10/08/2026.
 
 This guide describes Intel VTune (ITT) profiling support in `verl-hardware-plugin`
 for Intel XPU. Unlike Cambricon MLU's profiling support (see
@@ -25,6 +25,18 @@ needing to know about ITT or XPU itself, while `VtuneProfiler` is registered for
   `engine_workers.py`, without which a `tool_config.vtune` entry is dropped.
   The `VtuneProfiler` registration itself is pure monkeypatch and needs no
   core change.
+- **A VTune collector must be installed separately.** ITT is notify-only: the
+  markers this plugin emits are handed to whatever collector has attached to the
+  process, and are discarded when none has. The plugin side needs nothing beyond
+  PyTorch's ITT bindings, which Intel's XPU wheels ship
+  (`torch.profiler.itt.is_available()` is `True` on `torch 2.13.0+xpu`); the
+  collector is the `intel-vtune` oneAPI component, which the image in
+  [`docker/intel_gpu/`](../../docker/intel_gpu/) does **not** include — its
+  oneAPI install is the compiler/runtime set (ccl, compiler, mkl, mpi, pti, …).
+  Capturing a trace therefore needs a host with VTune installed, and enough
+  sampling permission for the collection type you pick (`hotspots` reads
+  `perf_event_open`, so a container typically needs
+  `kernel.perf_event_paranoid <= 2` or `CAP_PERFMON`).
 - Install both `verl` (from the `#7917` branch/ref) and `verl-hardware-plugin` in
   editable mode, and enable the plugin in Ray runtime:
 
@@ -97,3 +109,9 @@ what gets recorded) — the ITT ranges are emitted the same way either way.
 - If no ITT ranges show up in VTune, confirm the process was launched *under* a
   VTune collector (`vtune -collect ... -- python ...`), not run standalone —
   standalone runs execute the same code but nothing is listening for the events.
+- If `vtune: command not found`, the collector isn't installed (see
+  Prerequisites). Check with `ls /opt/intel/oneapi` for a `vtune` entry; a
+  standalone run is still harmless, it just records nothing. To tell a missing
+  collector apart from broken ITT bindings, check
+  `python -c "import torch.profiler.itt as i; print(i.is_available())"` — `True`
+  means the plugin's markers are live and only the collector is absent.
