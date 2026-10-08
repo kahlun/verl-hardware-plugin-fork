@@ -93,6 +93,17 @@ class PlatformXPU(PlatformBase):
 
         reduce_avg_allreduce_patch.apply()
 
+        # Pin each Ray worker's XPU without a verl-core change. Unlike the AVG
+        # patch above, this one is only in time because the platform singleton
+        # happens to be built during ``import verl`` rather than from inside
+        # ``Worker.__init__``, and it re-checks the selected platform per call
+        # instead of here -- a detection probe can construct PlatformXPU() on a
+        # host where another platform wins. Read that module's docstring before
+        # relying on it; the hook in verl-project/verl#8145 replaces all of it.
+        from verl_hardware_plugin.patches.xpu import ray_device_pin_patch
+
+        ray_device_pin_patch.apply()
+
     # ------------------------------------------------------------------
     # Core device management
     # ------------------------------------------------------------------
