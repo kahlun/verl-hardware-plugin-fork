@@ -959,7 +959,9 @@ class TestVtuneProfilerRegistration:
         original_init = DistProfiler.__init__
         original_flag = register_vtune._PATCHED
         register_vtune._PATCHED = False
-        register_vtune.apply_vtune_profiler_patch()
+        # The patch self-gates on a live XPU device; these tests are CPU-only.
+        with mock.patch.object(register_vtune, "_xpu_available", return_value=True):
+            register_vtune.apply_vtune_profiler_patch()
         try:
             yield DistProfiler
         finally:
@@ -991,6 +993,23 @@ class TestVtuneProfilerRegistration:
         init_after_first = patched.__init__
         register_vtune.apply_vtune_profiler_patch()
         assert patched.__init__ is init_after_first
+
+    def test_noop_when_xpu_unavailable(self):
+        """Constructing PlatformXPU on a non-XPU host must leave DistProfiler alone."""
+        from verl.utils.profiler.profile import DistProfiler
+        from verl_hardware_plugin.profilers import register_vtune
+
+        original_init = DistProfiler.__init__
+        original_flag = register_vtune._PATCHED
+        register_vtune._PATCHED = False
+        try:
+            with mock.patch.object(register_vtune, "_xpu_available", return_value=False):
+                register_vtune.apply_vtune_profiler_patch()
+            assert DistProfiler.__init__ is original_init
+            assert register_vtune._PATCHED is False
+        finally:
+            DistProfiler.__init__ = original_init
+            register_vtune._PATCHED = original_flag
 
 
 if __name__ == "__main__":
