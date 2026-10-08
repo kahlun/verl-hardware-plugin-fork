@@ -7,19 +7,24 @@ for Intel XPU. Unlike Cambricon MLU's profiling support (see
 [`user_guide_mlu/profiling.md`](../user_guide_mlu/profiling.md)), which reuses
 verl's built-in `global_profiler.tool=torch` path, there is no PyTorch-native
 profiler activity for Intel XPU equivalent to `torch.profiler.ProfilerActivity.MLU`.
-VTune support is wired in purely through the newer `PlatformBase` plugin hooks —
-`PlatformXPU.profiler_markers()` and `PlatformXPU.dist_profiler_cls()` — which
-verl core discovers without needing to know about ITT or XPU itself.
+VTune support is wired in two ways: the tracing markers come from the
+`PlatformXPU.profiler_markers()` plugin hook, which verl core discovers without
+needing to know about ITT or XPU itself, while `VtuneProfiler` is registered for
+`profiler.tool=vtune` by a plugin-side monkeypatch applied from
+`PlatformXPU.__init__` (verl core has no profiler registry).
 
 ## Prerequisites
 
-- These hooks (`attention_utils_module`, `profiler_markers`,
-  `dist_profiler_cls`) only exist on a verl-core build that
-  includes [verl-project/verl#7917](https://github.com/verl-project/verl/pull/7917)
+- `profiler_markers()` only exists on a verl-core build that includes
+  [verl-project/verl#7917](https://github.com/verl-project/verl/pull/7917)
   ("enable intel XPU to Verl with plugin mechanism with extra General API
   abstraction"), currently **open, not yet merged**. Against stock verl-core
-  `main`, `PlatformBase` has no such methods to override, so `profiler.tool=vtune`
-  silently falls through to `DistProfiler`'s no-op fallback instead of erroring.
+  `main`, `PlatformBase` has no such method to override, so ITT ranges are not
+  emitted — it falls back to nvtx or the generic no-op markers instead of
+  erroring. `#7917` also lifts the `tool_config` allowlist in
+  `engine_workers.py`, without which a `tool_config.vtune` entry is dropped.
+  The `VtuneProfiler` registration itself is pure monkeypatch and needs no
+  core change.
 - Install both `verl` (from the `#7917` branch/ref) and `verl-hardware-plugin` in
   editable mode, and enable the plugin in Ray runtime:
 

@@ -728,5 +728,55 @@ class TestVtuneProfilerToolConfig:
         assert profiler.discrete is True
 
 
+class TestVtuneProfilerRegistration:
+    """`profiler.tool: vtune` must resolve to VtuneProfiler once the patch is applied.
+
+    Core's own tool names must keep resolving to their core implementations, and an
+    unrecognised name must still fall through to core's no-op profiler.
+    """
+
+    @pytest.fixture
+    def patched(self):
+        pytest.importorskip("verl_hardware_plugin.profilers.itt_profile_xpu")
+        from verl.utils.profiler.profile import DistProfiler
+        from verl_hardware_plugin.profilers import register_vtune
+
+        original_init = DistProfiler.__init__
+        original_flag = register_vtune._PATCHED
+        register_vtune._PATCHED = False
+        register_vtune.apply_vtune_profiler_patch()
+        try:
+            yield DistProfiler
+        finally:
+            DistProfiler.__init__ = original_init
+            register_vtune._PATCHED = original_flag
+
+    def test_vtune_tool_resolves_to_vtune_profiler(self, patched):
+        from verl.utils.profiler.config import ProfilerConfig
+        from verl_hardware_plugin.profilers.itt_profile_xpu import VtuneProfiler
+
+        profiler = patched(rank=0, config=ProfilerConfig(ranks=[0], enable=True, tool="vtune"))
+        assert isinstance(profiler._impl, VtuneProfiler)
+
+    def test_builtin_tools_are_untouched(self, patched):
+        """The patch must only claim the `vtune` name, not shadow core's own dispatch."""
+        from verl.utils.profiler.config import ProfilerConfig
+        from verl.utils.profiler.profile import _NoOpProfiler
+        from verl_hardware_plugin.profilers.itt_profile_xpu import VtuneProfiler
+
+        # An unknown tool still falls through to core's no-op, as before.
+        profiler = patched(rank=0, config=ProfilerConfig(ranks=[0], enable=True, tool="not-a-tool"))
+        assert isinstance(profiler._impl, _NoOpProfiler)
+        assert not isinstance(profiler._impl, VtuneProfiler)
+
+    def test_patch_is_idempotent(self, patched):
+        """PlatformXPU may be constructed more than once; the wrapper must not stack."""
+        from verl_hardware_plugin.profilers import register_vtune
+
+        init_after_first = patched.__init__
+        register_vtune.apply_vtune_profiler_patch()
+        assert patched.__init__ is init_after_first
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -77,6 +77,17 @@ class PlatformXPU(PlatformBase):
         force_sum_reduction to work around this limitation.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Platform auto-detection constructs every registered platform to probe
+        # it, so being instantiated is not enough -- only patch verl once an XPU
+        # device is actually present.
+        if not (_ensure_torch_xpu() and torch.xpu.is_available()):
+            return
+        from verl_hardware_plugin.profilers.register_vtune import apply_vtune_profiler_patch
+
+        apply_vtune_profiler_patch()
+
     # ------------------------------------------------------------------
     # Core device management
     # ------------------------------------------------------------------
@@ -197,20 +208,6 @@ class PlatformXPU(PlatformBase):
         return False
 
     # ------------------------------------------------------------------
-    # Attention kernels
-    # ------------------------------------------------------------------
-
-    def attention_utils_module(self) -> Optional[str]:
-        # No dedicated flash-attn-equivalent package for XPU yet. Reuse NPU's
-        # pure-PyTorch index_first_axis/pad_input/rearrange/unpad_input
-        # (a direct copy of flash-attn's own bert_padding.py) rather than
-        # attention_utils.py's generic _fallback_* implementations: this is
-        # the same code path validated end-to-end (GRPO/PPO/SFT) on real
-        # Intel Arc Pro B-series hardware before this hook existed, whereas
-        # the generic fallback has no such hardware validation yet.
-        return "verl.utils.npu_flash_attn_utils"
-
-    # ------------------------------------------------------------------
     # Profiling helpers
     # ------------------------------------------------------------------
 
@@ -230,9 +227,9 @@ class PlatformXPU(PlatformBase):
         pass
 
     def profiler_markers(self):
-        # Intel VTune (ITT) tracing markers, used as the tracing-marker
-        # backend when no `nvtx` package is installed. See
-        # verl/utils/profiler/__init__.py for how verl core discovers this.
+        # Intel VTune (ITT) tracing markers. verl core asks the platform for
+        # these first, before falling back to nvtx/mstx/generic markers -- see
+        # verl/utils/profiler/__init__.py for how it discovers them.
         from verl_hardware_plugin.profilers import itt_profile_xpu
 
         return (
@@ -241,16 +238,6 @@ class PlatformXPU(PlatformBase):
             itt_profile_xpu.mark_annotate,
             itt_profile_xpu.marked_timer,
         )
-
-    def dist_profiler_cls(self, tool: str):
-        # Selected when a training config sets `profiler.tool: vtune`. See
-        # verl/utils/profiler/profile.py:DistProfiler for how verl core
-        # discovers this.
-        if tool != "vtune":
-            return None
-        from verl_hardware_plugin.profilers.itt_profile_xpu import VtuneProfiler
-
-        return VtuneProfiler
 
     # ------------------------------------------------------------------
     # Model patches

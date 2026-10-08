@@ -3,14 +3,12 @@
 
 """Intel VTune (ITT) profiling backend for verl.
 
-Unlike torch_profile_mlu.py (which monkey-patches verl's profiler utilities
-directly), this module is wired in purely through the newer PlatformBase
-hooks — PlatformXPU.profiler_markers() (tracing markers) and
-PlatformXPU.dist_profiler_cls() (selected when `profiler.tool: vtune`). See
-verl/utils/profiler/__init__.py and verl/utils/profiler/profile.py for how
-verl core discovers these without needing to know about ITT/XPU itself.
-There is nothing to register from profilers/__init__.py — both hooks are
-looked up lazily by verl core, not applied at import time.
+Two pieces, wired up separately:
+
+- The tracing markers below are returned by ``PlatformXPU.profiler_markers()``,
+  which verl core asks for when it resolves its own marker functions.
+- :class:`VtuneProfiler` serves ``profiler.tool: vtune``, registered by
+  ``profilers/register_vtune.py``.
 """
 
 import functools

@@ -3,11 +3,8 @@
 
 """Profiler integrations via monkey-patching verl's profiler utilities.
 
-Intel XPU's profiler integration (itt_profile_xpu.py) is the exception: it
-uses the newer PlatformXPU.profiler_markers()/dist_profiler_cls() hooks
-instead of monkey-patching, so it needs no registration call here — verl
-core looks those up lazily through get_platform() rather than having them
-applied at import time.
+A backend wired through a platform hook, or through a patch that its own
+platform applies, needs no registration call here.
 """
 
 import logging
