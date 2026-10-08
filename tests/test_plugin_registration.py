@@ -20,45 +20,63 @@ def _stub_training_engine_runtimes():
     The lightweight bases let the complete registry suite run on a CPU-only CI host.
     """
 
-    class _ImportPlaceholder:
+    # BaseEngine must come from a real, unmocked import -- it's the base class
+    # _StubEngine below needs, and importing it here (before any sys.modules
+    # patching) runs verl/workers/engine/__init__.py for real, which resolves
+    # cleanly on its own (its try/except ImportError guards handle the
+    # genuinely-missing torchtitan/veomni/automodel/mindspeed/megatron
+    # packages already).
+    from verl.workers.engine.base import BaseEngine
+
+    class _StubEngine(BaseEngine):
         pass
 
+    # Populate every module attribute with _StubEngine *before* patching
+    # sys.modules, not after. verl/workers/engine/__init__.py's mindspeed
+    # import defines `class MindspeedEngineWithLMHead(MegatronEngineWithLMHead)`
+    # with a live @EngineRegistry.register(...) decorator that asserts
+    # issubclass(engine_class, BaseEngine) *at class-definition time*. If
+    # that import gets re-triggered while these are still placeholders (as
+    # they were here until the `yield`), the assertion fails for real --
+    # confirmed via AssertionError at verl/workers/engine/base.py:376 on
+    # real hardware. Only the plugin's own subsequent imports need to see
+    # the stub; verl-core's internal mindspeed/megatron wiring never should.
     fsdp = ModuleType("verl.workers.engine.fsdp")
-    fsdp.FSDPEngine = _ImportPlaceholder
-    fsdp.FSDPEngineWithLMHead = _ImportPlaceholder
+    fsdp.FSDPEngine = _StubEngine
+    fsdp.FSDPEngineWithLMHead = _StubEngine
+    fsdp.FSDPTurboEngineWithLMHead = _StubEngine
 
     fsdp_transformer = ModuleType("verl.workers.engine.fsdp.transformer_impl")
-    fsdp_transformer.FSDPEngine = _ImportPlaceholder
-    fsdp_transformer.FSDPEngineWithLMHead = _ImportPlaceholder
-    fsdp_transformer.FSDPEngineWithValueHead = _ImportPlaceholder
+    fsdp_transformer.FSDPEngine = _StubEngine
+    fsdp_transformer.FSDPEngineWithLMHead = _StubEngine
+    fsdp_transformer.FSDPEngineWithValueHead = _StubEngine
 
     megatron_transformer = ModuleType("verl.workers.engine.megatron.transformer_impl")
-    megatron_transformer.MegatronEngine = _ImportPlaceholder
-    megatron_transformer.MegatronEngineWithLMHead = _ImportPlaceholder
-    megatron_transformer.MegatronEngineWithValueHead = _ImportPlaceholder
+    megatron_transformer.MegatronEngine = _StubEngine
+    megatron_transformer.MegatronEngineWithLMHead = _StubEngine
+    megatron_transformer.MegatronEngineWithValueHead = _StubEngine
+
+    torchtitan_transformer = ModuleType("verl.workers.engine.torchtitan.transformer_impl")
+    torchtitan_transformer.TorchTitanEngine = _StubEngine
+    torchtitan_transformer.TorchTitanEngineWithLMHead = _StubEngine
+
+    torchtitan_utils = ModuleType("verl.workers.engine.torchtitan.utils")
+    torchtitan_utils.NoOpDataLoader = mock.MagicMock()
+    torchtitan_utils.derive_torchtitan_name_and_flavor = mock.MagicMock()
+    torchtitan_utils.enable_fsdp_gradient_division = mock.MagicMock()
+    torchtitan_utils.get_attention_masks = mock.MagicMock()
 
     engine_modules = {
         "verl.workers.engine.fsdp": fsdp,
         "verl.workers.engine.fsdp.transformer_impl": fsdp_transformer,
         "verl.workers.engine.megatron.transformer_impl": megatron_transformer,
+        "verl.workers.engine.torchtitan.transformer_impl": torchtitan_transformer,
+        "verl.workers.engine.torchtitan.utils": torchtitan_utils,
     }
     with (
         mock.patch.dict(os.environ, {"VERL_USE_EXTERNAL_PLUGINS": "none"}),
         mock.patch.dict(sys.modules, engine_modules),
     ):
-        from verl.workers.engine.base import BaseEngine
-
-        class _StubEngine(BaseEngine):
-            pass
-
-        fsdp.FSDPEngine = _StubEngine
-        fsdp.FSDPEngineWithLMHead = _StubEngine
-        fsdp_transformer.FSDPEngine = _StubEngine
-        fsdp_transformer.FSDPEngineWithLMHead = _StubEngine
-        fsdp_transformer.FSDPEngineWithValueHead = _StubEngine
-        megatron_transformer.MegatronEngine = _StubEngine
-        megatron_transformer.MegatronEngineWithLMHead = _StubEngine
-        megatron_transformer.MegatronEngineWithValueHead = _StubEngine
         yield
 
 
@@ -333,6 +351,47 @@ class TestPlatformRegistration:
 
         assert PlatformTPU().visible_devices_envvar() == "CUDA_VISIBLE_DEVICES"
 
+    def test_tpu_env_vars_cover_whole_pool_regardless_of_caller_node(self):
+        """The PJRT mesh spans every bundle of the pool's placement groups.
+
+        get_worker_env_vars() runs in the TaskRunner, whose node Ray picks freely. An earlier
+        version kept only the placement group containing the *caller's* IP, which produced a
+        4-address slice-builder list on an 8-chip pool whenever the TaskRunner landed on a
+        TPU host ("Expected 8 worker addresses, got 4").
+        """
+        from unittest import mock
+
+        import ray
+
+        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+
+        nodes = [
+            {"NodeID": "n0", "NodeManagerAddress": "10.0.0.1", "Alive": True, "Resources": {"TPU": 4}, "Labels": {}},
+            {"NodeID": "n1", "NodeManagerAddress": "10.0.0.2", "Alive": True, "Resources": {"TPU": 4}, "Labels": {}},
+        ]
+        tables = {
+            "pg0": {"state": "CREATED", "bundles_to_node_id": {i: "n0" for i in range(4)}},
+            "pg1": {"state": "CREATED", "bundles_to_node_id": {i: "n1" for i in range(4)}},
+        }
+        pgs = [mock.Mock(id="pg0"), mock.Mock(id="pg1")]
+
+        def env_for_caller(caller_ip):
+            with (
+                mock.patch.object(ray, "nodes", return_value=nodes),
+                mock.patch.object(ray._private.state.state, "placement_group_table", side_effect=tables.__getitem__),
+                mock.patch.object(ray.util, "get_node_ip_address", return_value=caller_ip),
+            ):
+                return PlatformTPU().get_tpu_env_vars(
+                    rank=5, world_size=8, local_rank=1, local_world_size=4, name_prefix="global_pool", pgs=pgs
+                )
+
+        head = env_for_caller("10.0.9.9")
+        on_slice_host = env_for_caller("10.0.0.1")
+        assert head == on_slice_host
+        assert head["TPU_WORKER_HOSTNAMES"] == "10.0.0.1,10.0.0.2"
+        assert len(head["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
+        assert head["CLOUD_TPU_TASK_ID"] == "1" and head["TPU_VISIBLE_CHIPS"] == "1"
+
     def test_tpu_cudart_returns_none(self):
         """There is no CUDA runtime on a TPU host; PlatformBase documents None as the answer."""
         from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
@@ -519,6 +578,22 @@ class TestEngineRegistration:
             EngineRegistry._engines["language_model"]["megatron"][("gcu", "enflame")] is MegatronEnflameEngineWithLMHead
         )
 
+    def test_torchtitan_tpu_engine_registered(self):
+        # detach_tree landed in verl core after the 0.9.0 release. The TPU engine imports it, so on
+        # an older verl this test would fail with an ImportError that says nothing about the TPU
+        # plugin. Skip with the real reason instead; every other engine here is version-agnostic.
+        import verl.workers.engine.utils as engine_utils
+
+        if not hasattr(engine_utils, "detach_tree"):
+            pytest.skip("verl.workers.engine.utils.detach_tree is required by the TPU engine (verl > 0.9.0)")
+
+        from verl.workers.engine.base import EngineRegistry
+        from verl_hardware_plugin.engines.torchtitan_tpu import TorchTitanTPUEngineWithLMHead
+
+        assert (
+            EngineRegistry._engines["language_model"]["torchtitan"][("tpu", "google")] is TorchTitanTPUEngineWithLMHead
+        )
+
 
 class TestFLEnvManager:
     """Test FLEnvManager utility."""
@@ -683,15 +758,155 @@ class TestMayEnableFlagGems:
                         may_enable_flag_gems(phase="training")
 
 
-class TestVtuneProfilerToolConfig:
-    """VtuneProfiler must accept the tool_config verl core actually hands it.
+class TestReduceAvgPatchWiring:
+    """The reduce_avg monkeypatch must fire on platform *selection*, not on
+    mere XPU hardware/SDK *presence*.
 
-    verl core has no ``tool_config.vtune`` schema entry, so ``tool_config.get("vtune")``
-    resolves to None and DistProfiler then substitutes the *whole* tool_config mapping
-    (verl/utils/profiler/profile.py: ``if tool_config is None: tool_config = config.tool_config``).
-    That mapping is truthy but carries no ``discrete``, so reading it as a plain attribute
-    raises AttributeError for every ``profiler.tool=vtune`` run. ``discrete`` is a no-op on
-    XPU anyway (PlatformXPU.profiler_start/profiler_stop are no-ops), so False is correct.
+    verl.plugin.platform.platform_manager._create_platform() only constructs
+    PlatformXPU() once platform detection (VERL_PLATFORM=intel, or
+    auto-detection) has actually picked "intel" for this process. Applying
+    the patch from the shared verl_hardware_plugin/__init__.py instead would
+    fire on any host where XPU merely happens to be importable, even when a
+    different platform is selected for the run -- e.g. VERL_PLATFORM=nvidia
+    explicitly set on a mixed host would still get its process-wide
+    torch.distributed.all_reduce(op=AVG) semantics changed for no reason.
+    """
+
+    def test_platform_xpu_init_applies_patches(self):
+        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+
+        with mock.patch("verl_hardware_plugin.patches.xpu.reduce_avg_allreduce_patch.apply") as fake_apply:
+            PlatformXPU()
+
+        fake_apply.assert_called_once()
+
+    def test_plugin_init_does_not_bind_reduce_avg_patch(self):
+        import verl_hardware_plugin
+
+        assert not hasattr(verl_hardware_plugin, "apply_all_patches")
+        assert not hasattr(verl_hardware_plugin, "reduce_avg_allreduce_patch_xpu")
+
+
+class TestReduceAvgAllReducePatch:
+    """torch.distributed.all_reduce(op=AVG) -> SUM + manual divide, scoped to
+    xccl process groups only -- a gloo/nccl group in the same process (e.g. a
+    CPU-only Ray actor's coordination group) must keep native AVG.
+
+    _applied is process-global module state (the same property that makes
+    this patch risky in production -- see the module's own docstring), so
+    each test must save/restore torch.distributed.all_reduce and reset the
+    flag, or tests would leak into each other.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_patch_state(self):
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+
+        original_all_reduce = dist.all_reduce
+        patch_mod._applied = False
+        yield
+        dist.all_reduce = original_all_reduce
+        patch_mod._applied = False
+
+    def test_noop_when_xpu_unavailable(self):
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+
+        before = dist.all_reduce
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=False):
+            patch_mod.apply()
+
+        assert dist.all_reduce is before
+
+    def test_avg_becomes_sum_plus_divide(self):
+        import torch
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+
+        fake_original = mock.MagicMock()
+        tensor = torch.tensor([4.0])
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
+            with mock.patch.object(dist, "all_reduce", fake_original):
+                patch_mod.apply()
+                patched = dist.all_reduce
+                assert patched is not fake_original
+
+                with mock.patch.object(dist, "get_backend", return_value="xccl"):
+                    with mock.patch.object(dist, "get_world_size", return_value=4):
+                        patched(tensor, op=dist.ReduceOp.AVG)
+
+        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False)
+        assert tensor.item() == 1.0
+
+    def test_non_xccl_backend_passes_through_even_with_avg(self):
+        """A gloo/nccl group in the same process must keep native AVG untouched."""
+        import torch
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+
+        fake_original = mock.MagicMock()
+        tensor = torch.tensor([4.0])
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
+            with mock.patch.object(dist, "all_reduce", fake_original):
+                patch_mod.apply()
+                with mock.patch.object(dist, "get_backend", return_value="gloo"):
+                    dist.all_reduce(tensor, op=dist.ReduceOp.AVG, group="cpu_group")
+
+        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.AVG, group="cpu_group", async_op=False)
+
+    def test_non_avg_op_passes_through_unchanged(self):
+        import torch
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+
+        fake_original = mock.MagicMock()
+        tensor = torch.tensor([4.0])
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
+            with mock.patch.object(dist, "all_reduce", fake_original):
+                patch_mod.apply()
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group="g")
+
+        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.SUM, group="g", async_op=False)
+
+    def test_async_avg_falls_through_unpatched(self):
+        import torch
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+
+        fake_original = mock.MagicMock()
+        tensor = torch.tensor([4.0])
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
+            with mock.patch.object(dist, "all_reduce", fake_original):
+                patch_mod.apply()
+                dist.all_reduce(tensor, op=dist.ReduceOp.AVG, async_op=True)
+
+        fake_original.assert_called_once_with(tensor, op=dist.ReduceOp.AVG, group=None, async_op=True)
+
+    def test_idempotent(self):
+        import torch.distributed as dist
+
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch as patch_mod
+
+        with mock.patch.object(patch_mod, "_xpu_available", return_value=True):
+            patch_mod.apply()
+            patched_once = dist.all_reduce
+            patch_mod.apply()
+            assert dist.all_reduce is patched_once
+
+
+class TestVtuneProfilerToolConfig:
+    """VtuneProfiler must accept any tool_config shape verl core hands it.
+
+    There is no ``tool_config.vtune`` schema entry, so core may pass None or the whole
+    tool_config mapping instead of a per-tool config. Neither may raise, and ``discrete``
+    must default to False.
     """
 
     @staticmethod

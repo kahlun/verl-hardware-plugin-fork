@@ -77,15 +77,16 @@ class PlatformXPU(PlatformBase):
         force_sum_reduction to work around this limitation.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Platform auto-detection constructs every registered platform to probe
-        # it, so being instantiated is not enough -- only patch verl once an XPU
-        # device is actually present.
-        if not (_ensure_torch_xpu() and torch.xpu.is_available()):
-            return
+    def __init__(self) -> None:
+        # Patch from here rather than from the shared verl_hardware_plugin
+        # package, so importing the plugin on a non-XPU host patches nothing.
+        # Each apply() below is responsible for its own device check: platform
+        # detection constructs every registered platform to probe it, so being
+        # instantiated does not mean this platform was the one selected.
+        from verl_hardware_plugin.patches.xpu import reduce_avg_allreduce_patch
         from verl_hardware_plugin.profilers.register_vtune import apply_vtune_profiler_patch
 
+        reduce_avg_allreduce_patch.apply()
         apply_vtune_profiler_patch()
 
     # ------------------------------------------------------------------

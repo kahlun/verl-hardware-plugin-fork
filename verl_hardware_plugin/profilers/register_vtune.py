@@ -28,14 +28,26 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 
 
+def _xpu_available() -> bool:
+    try:
+        import torch
+
+        return hasattr(torch, "xpu") and torch.xpu.is_available()
+    except Exception:  # pragma: no cover - a probe must never raise
+        return False
+
+
 def apply_vtune_profiler_patch() -> None:
     """Make ``DistProfiler(config=...tool="vtune")`` build a ``VtuneProfiler``.
 
-    Idempotent, and a no-op when verl core is too old/new to carry the attributes
-    this relies on -- a failed profiler registration must never break training.
+    Idempotent, and a no-op without a usable XPU device or when verl core does
+    not expose the profiler internals this relies on -- a failed profiler
+    registration must never break training.
     """
     global _PATCHED
     if _PATCHED:
+        return
+    if not _xpu_available():
         return
 
     try:

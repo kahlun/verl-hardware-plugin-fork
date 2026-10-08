@@ -4,30 +4,38 @@
 
 This document describes Google TPU support in `verl-hardware-plugin`.
 
-The plugin registers the TPU platform: device metadata, Ray resource configuration, and the
-worker environment. It does not provide a TPU training engine, and the extension hooks the
-platform implements (`supports_colocated_worker_groups`, `get_worker_env_vars`,
-`ray_local_rank_override`) have no call sites in verl core yet.
+The plugin registers the TPU platform (`PlatformTPU`: device metadata, Ray resource configuration,
+and the PJRT worker environment), the TorchTitan TPU training engine (`TorchTitanTPUEngineWithLMHead`
+under `verl_hardware_plugin/engines/torchtitan_tpu.py`), and a vLLM rollout for TPU.
 
 ## Directory Structure
 
 ```text
 verl_hardware_plugin/
-└── platforms
-    └── platform_tpu.py               # TPU platform settings
+├── engines
+│   ├── torchtitan_tpu.py             # TorchTitan TPU training engine (FSDP2 / SPMD)
+│   ├── tpu_checkpoint_engine.py      # Sends the trainer's weights to the vLLM rollout
+│   └── tpu_utils.py                  # Sequence bucketing and TorchTitan TPU config/input helpers
+├── platforms
+│   └── platform_tpu.py               # TPU platform settings
+└── rollout
+    ├── tpu_vllm.py                   # vLLM rollout replica and server for TPU
+    └── tpu_vllm_patches.py           # vLLM / vllm-torchtpu patches for multi-host TPU
 ```
 
 ```text
 user_guide_tpu/
 ├── README.md                         # This file
 ├── install_guidance.md               # Installation and environment setup
-└── quick_start.md                    # Selecting and verifying the platform
+├── quick_start.md                    # Selecting and verifying the platform
+└── rollout.md                        # Running the vLLM rollout on TPU
 ```
 
 ## Getting Started
 
 - [Installation Guide](./install_guidance.md) — prerequisites and environment setup
 - [Quick Start](./quick_start.md) — select the TPU platform and verify it resolves
+- [vLLM Rollout](./rollout.md) — run GRPO with the vLLM rollout on TPU
 
 ## Platform Summary
 
