@@ -903,6 +903,50 @@ class TestReduceAvgAllReducePatch:
             assert dist.all_reduce is patched_once
 
 
+class TestProfilerMarkersHook:
+    """``profiler_markers()`` is the one ``PlatformBase`` hook this plugin implements.
+
+    verl core calls it to discover trace markers before falling back to nvtx/mstx/generic
+    ones, and unpacks the result positionally, so both the arity and the order matter.
+    """
+
+    @staticmethod
+    def _markers():
+        pytest.importorskip("verl_hardware_plugin.accelerators.xpu.profilers.itt_profile_xpu")
+        from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU
+
+        # Bypass __init__: it applies this platform's monkeypatches, which is not what
+        # is under test here (and self-gates to a no-op on a CPU-only host anyway).
+        return PlatformXPU.profiler_markers(object.__new__(PlatformXPU))
+
+    def test_returns_the_four_itt_markers_in_core_order(self):
+        from verl_hardware_plugin.accelerators.xpu.profilers import itt_profile_xpu
+
+        assert self._markers() == (
+            itt_profile_xpu.mark_start_range,
+            itt_profile_xpu.mark_end_range,
+            itt_profile_xpu.mark_annotate,
+            itt_profile_xpu.marked_timer,
+        )
+
+    def test_markers_are_callable_without_a_collector(self):
+        """ITT is notify-only: with no collector attached these must be no-ops, not errors."""
+        mark_start_range, mark_end_range, mark_annotate, marked_timer = self._markers()
+
+        mark_end_range(mark_start_range("probe"))
+
+        @mark_annotate("decorated")
+        def _work():
+            return 42
+
+        assert _work() == 42
+
+        timing = {}
+        with marked_timer("timed", timing):
+            pass
+        assert "timed" in timing
+
+
 class TestVtuneProfilerToolConfig:
     """VtuneProfiler must accept any tool_config shape verl core hands it.
 
