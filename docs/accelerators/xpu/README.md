@@ -1,6 +1,6 @@
 # Intel XPU User Guide
 
-Last updated: 09/24/2026.
+Last updated: 10/09/2026.
 
 ## Introduction
 
@@ -58,4 +58,4 @@ docs/accelerators/xpu/
 ## Related Documentation
 
 - [verl plugin system](../../development.md)
-- [Docker image for verl + Intel XPU](https://github.com/kahlun/verl/tree/xpu-main/docker/intel_gpu/README.md)
+- [Docker image for verl + Intel XPU](https://github.com/verl-project/verl/pull/7371) — `docker/intel_gpu/`, proposed in this open upstream PR

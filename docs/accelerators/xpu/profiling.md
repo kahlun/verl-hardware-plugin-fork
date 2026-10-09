@@ -1,13 +1,10 @@
 # Intel VTune Profiling Guide
 
-Last updated: 10/08/2026.
+Last updated: 10/09/2026.
 
 This guide describes Intel VTune (ITT) profiling support in `verl-hardware-plugin`
-for Intel XPU. Unlike Cambricon MLU's profiling support (see
-[`user_guide_mlu/profiling.md`](../mlu/profiling.md)), which reuses
-verl's built-in `global_profiler.tool=torch` path, there is no PyTorch-native
-profiler activity for Intel XPU equivalent to `torch.profiler.ProfilerActivity.MLU`.
-VTune support is wired in two ways: the tracing markers come from the
+for Intel XPU. There is no PyTorch-native profiler activity for Intel XPU, so
+VTune support is wired in two ways instead: the tracing markers come from the
 `PlatformXPU.profiler_markers()` plugin hook, which verl core discovers without
 needing to know about ITT or XPU itself, while `VtuneProfiler` is registered for
 `profiler.tool=vtune` by a plugin-side monkeypatch applied from
@@ -15,30 +12,32 @@ needing to know about ITT or XPU itself, while `VtuneProfiler` is registered for
 
 ## Prerequisites
 
-- `profiler_markers()` only exists on a verl-core build that includes
+- `profiler_markers()` was added by
   [verl-project/verl#7917](https://github.com/verl-project/verl/pull/7917)
-  ("enable intel XPU to Verl with plugin mechanism with extra General API
-  abstraction"), currently **open, not yet merged**. Against stock verl-core
-  `main`, `PlatformBase` has no such method to override, so ITT ranges are not
-  emitted — it falls back to nvtx or the generic no-op markers instead of
-  erroring. `#7917` also lifts the `tool_config` allowlist in
-  `engine_workers.py`, without which a `tool_config.vtune` entry is dropped.
-  The `VtuneProfiler` registration itself is pure monkeypatch and needs no
-  core change.
+  ("feat: add a profiler_markers() platform hook and share the attention
+  padding helpers"), merged into verl-core `main` on 2026-10-08. Against an
+  older checkout, `PlatformBase` has no such method to override, so ITT
+  ranges are not emitted — it falls back to nvtx or the generic no-op markers
+  instead of erroring. `#7917` also lifted the `tool_config` allowlist in
+  `engine_workers.py`; without it a `tool_config.vtune` entry is dropped. The
+  `VtuneProfiler` registration itself is pure monkeypatch and needs no core
+  change either way.
 - **A VTune collector must be installed separately.** ITT is notify-only: the
   markers this plugin emits are handed to whatever collector has attached to the
   process, and are discarded when none has. The plugin side needs nothing beyond
   PyTorch's ITT bindings, which Intel's XPU wheels ship
   (`torch.profiler.itt.is_available()` is `True` on `torch 2.13.0+xpu`); the
-  collector is the `intel-vtune` oneAPI component, which the image in
-  [`docker/intel_gpu/`](https://github.com/kahlun/verl/tree/xpu-main/docker/intel_gpu/) does **not** include — its
-  oneAPI install is the compiler/runtime set (ccl, compiler, mkl, mpi, pti, …).
-  Capturing a trace therefore needs a host with VTune installed, and enough
-  sampling permission for the collection type you pick (`hotspots` reads
+  collector is the `intel-vtune` oneAPI component, which the Docker image
+  proposed in [verl-project/verl#7371](https://github.com/verl-project/verl/pull/7371)
+  (`docker/intel_gpu/`, still open) does **not** include — its oneAPI install
+  is the compiler/runtime set (ccl, compiler, mkl, mpi, pti, …). Capturing a
+  trace therefore needs a host with VTune installed, and enough sampling
+  permission for the collection type you pick (`hotspots` reads
   `perf_event_open`, so a container typically needs
   `kernel.perf_event_paranoid <= 2` or `CAP_PERFMON`).
-- Install both `verl` (from the `#7917` branch/ref) and `verl-hardware-plugin` in
-  editable mode, and enable the plugin in Ray runtime:
+- Install `verl` (`main` includes #7917 as of 2026-10-08) and
+  `verl-hardware-plugin` in editable mode, and enable the plugin in Ray
+  runtime:
 
   ```yaml
   working_dir: ./
@@ -104,8 +103,8 @@ what gets recorded) — the ITT ranges are emitted the same way either way.
 ## Troubleshooting
 
 - If `profiler.tool=vtune` appears to do nothing, confirm the running verl-core
-  build actually includes #7917 (see Prerequisites) — against stock `main` this
-  is a silent no-op, not an error.
+  build actually includes #7917 (merged 2026-10-08; see Prerequisites) — on an
+  older checkout this is a silent no-op, not an error.
 - If no ITT ranges show up in VTune, confirm the process was launched *under* a
   VTune collector (`vtune -collect ... -- python ...`), not run standalone —
   standalone runs execute the same code but nothing is listening for the events.
