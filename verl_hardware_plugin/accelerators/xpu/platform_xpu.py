@@ -93,6 +93,16 @@ class PlatformXPU(PlatformBase):
 
         reduce_avg_allreduce_patch.apply()
 
+        # Same reasoning as above, for NUMA-local CPU pinning: verl-core's
+        # set_numa_affinity() is a pynvml call that no-ops on XPU today,
+        # paying cross-socket memory traffic for the life of the job. See
+        # numa_affinity_patch's module docstring for the pyzes-based
+        # equivalent and the one call site (checkpoint merging) it can't
+        # reach no matter where it's applied from.
+        from verl_hardware_plugin.accelerators.xpu.patches import numa_affinity_patch
+
+        numa_affinity_patch.apply()
+
     # ------------------------------------------------------------------
     # Core device management
     # ------------------------------------------------------------------
