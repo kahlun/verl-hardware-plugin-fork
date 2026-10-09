@@ -97,4 +97,44 @@ pytest tests/ -q                                   # 118 passed
 The test file covers: the unpatched bug (rank lands on device 0), the patch pinning the physical
 id Ray assigned, CPU-only actors and in-process (non-Ray) `Worker` construction left alone, the
 late-apply fallback, the late-apply *silence* when the fallback is removed, and the import-time
-installation described above. Not run on hardware — the end-to-end 2×B60 evidence is in #8145.
+installation described above.
+
+## Verified on hardware: 2× Intel Arc Pro B60, 2026-10-09
+
+Both arms in one pod, on the same two GPUs, back to back. The image is
+`verl-intel-gpu:kahlunte-pr23-xpu-docker-fix2` — the revision where this collision was first
+measured, and whose verl-core still has the gate (`PlatformBase.ray_device_index exists False`,
+`NOSET gate still in core worker.py True`), so the control is a real control and not a core
+already carrying #8145. **verl-core is byte-identical across the arms**; between them only one
+module is added to the installed plugin and `PlatformXPU.__init__` is wired to call its `apply()`.
+
+Probe: per-rank device identity at four points, including through verl's own
+`_setup_env_cuda_visible_devices()`, `initialize_global_process_group_ray()` and
+`create_device_mesh()`, plus a 6 GB allocation on rank 0 cross-checked against every rank's free
+memory, plus SUM/AVG on WORLD and on the FSDP mesh. No `RAY_EXPERIMENTAL_NOSET_*` variable set in
+either arm.
+
+| | ARM A — plugin as shipped | ARM B — plugin + `ray_device_pin_patch` |
+| --- | --- | --- |
+| `Worker._setup_env_cuda_visible_devices` owned by | `verl.single_controller.base.worker` | `verl_hardware_plugin.patches.xpu.ray_device_pin_patch` |
+| `LOCAL_RANK` after verl's setup | `<unset>`, `<unset>` | `0`, `1` |
+| distinct physical GPUs, at actor start | 1 of 2 | 1 of 2 |
+| distinct physical GPUs, after verl setup / init_pg / device_mesh | **1 of 2** (`4e00`, `4e00`) | **2 of 2** (`4e00`, `ba00`) |
+| rank 0 allocates 6 GB | rank 1's free memory drops too, 23561 → 17351 → **SHARED** | rank 1 unchanged at 23908 → **SEPARATE** |
+| all_reduce SUM, WORLD and `mesh[fsdp]` | OK | OK |
+| all_reduce AVG, WORLD and `mesh[fsdp]` | 4 of 4 abort (oneCCL scheduler path) | 4 of 4 OK |
+
+So route A does fix the real defect on real hardware, with no verl-core change: the patch is
+installed from `PlatformXPU.__init__` during `import verl`, wins the race against
+`Worker.__init__`, and pins the physical id Ray assigned. The fallback to route B never fired
+(no warning, and `LOCAL_RANK` is already correct at step 2) — route A was in time, exactly as
+the import chain above predicts, on this core revision.
+
+One reporting artifact: ARM B's facts line `NOSET gate still in core worker.py False` is a
+measurement of `inspect.getsource(Worker._setup_env_cuda_visible_devices)`, which after patching
+returns the *wrapper's* source. Core's file is untouched; the gate is still there, with the
+original method called inside the wrapper.
+
+The AVG rows are the collision's second-order effect, not a separate finding: with both ranks on
+one device oneCCL takes the scheduler path, which does not implement AVG (MLSL-4062). They flip
+to OK for the same reason the UUIDs become distinct.
