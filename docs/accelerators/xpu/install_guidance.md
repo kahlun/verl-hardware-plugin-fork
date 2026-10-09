@@ -10,36 +10,29 @@ in verl-core for the plugin pattern this follows.
 - PyTorch with XPU support (`torch.xpu.is_available() == True`)
 - vLLM with XPU kernels — either the prebuilt wheel from vLLM's XPU wheel
   index (`pip install "vllm==<version>+xpu" --extra-index-url
-  https://wheels.vllm.ai/<version>/xpu`; see
-  `docker/intel_gpu/Dockerfile.intel_gpu` in
-  [verl-project/verl#7371](https://github.com/verl-project/verl/pull/7371)
-  for the exact pinned command) or built from source with
+  https://wheels.vllm.ai/<version>/xpu`) or built from source with
   `VLLM_TARGET_DEVICE=xpu`. The default PyPI `pip install vllm` wheel does
   not ship XPU kernels.
 - oneCCL runtime for the `xccl` distributed backend
 
 **verl-core version note:** the one `PlatformBase` hook this plugin
-implements, `profiler_markers()`, was added by
-[verl-project/verl#7917](https://github.com/verl-project/verl/pull/7917)
-(merged 2026-10-08). A `verl-project/verl:main` checkout from before that date
-still installs and runs this plugin, but the hook silently no-ops on it: ITT
-ranges are not emitted, and the `tool_config` allowlist in
-`engine_workers.py` that #7917 also lifted drops a `tool_config.vtune` entry.
-`VtuneProfiler` itself is registered by a plugin-side monkeypatch and works
-either way. Attention padding needs nothing from this plugin: verl core uses
+implements, `profiler_markers()`, was merged into `verl-project/verl:main` on
+2026-10-08. A checkout from before that date still installs and runs this
+plugin, but the hook silently no-ops on it: ITT ranges are not emitted, and
+the `tool_config` allowlist in `engine_workers.py` that the same change
+lifted drops a `tool_config.vtune` entry. `VtuneProfiler` itself is
+registered by a plugin-side monkeypatch and works either way. Attention
+padding needs nothing from this plugin: verl core uses
 its own pure-PyTorch `attention_padding_utils` whenever `flash_attn` is
 unavailable. The `xccl` reduce_avg workaround is likewise unaffected — it's a
 plugin-side monkeypatch over `torch.distributed.all_reduce`
 (`accelerators/xpu/patches/reduce_avg_allreduce_patch.py`), not a
 `PlatformBase` hook.
-A Docker image build (`docker/intel_gpu/`) is proposed in
-[verl-project/verl#7371](https://github.com/verl-project/verl/pull/7371),
-still open — see the Docker section below.
 
 ## 1. Install verl and verl-hardware-plugin
 
 ```bash
-# Install verl (needs #7917, merged into main on 2026-10-08 — see note above)
+# Install verl (needs the profiler_markers() hook, on main since 2026-10-08 — see note above)
 git clone https://github.com/verl-project/verl.git
 cd verl
 pip install -e .
@@ -73,17 +66,6 @@ Expected on Intel GPU: `device: xpu / vendor: intel`. If it instead falls
 back to `nvidia`, the plugin was not discovered — check that `pip install`
 completed without error and that no `VERL_USE_EXTERNAL_PLUGINS=none` is set
 in the environment.
-
-## Docker
-
-A prebuilt image definition (`docker/intel_gpu/`) is proposed in
-[verl-project/verl#7371](https://github.com/verl-project/verl/pull/7371), open
-against upstream verl-core and not yet merged — it clones verl-core at a
-pinned ref, installs vLLM from its prebuilt XPU wheel index, and installs
-this plugin on top. See that PR's `docker/intel_gpu/README.md` for build/run
-instructions and the full software stack table. This is the fastest way to
-get a known-good verl-core + plugin combination once it merges, since it
-sidesteps the verl-core version note above.
 
 ## Next Steps
 

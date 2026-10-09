@@ -12,30 +12,25 @@ needing to know about ITT or XPU itself, while `VtuneProfiler` is registered for
 
 ## Prerequisites
 
-- `profiler_markers()` was added by
-  [verl-project/verl#7917](https://github.com/verl-project/verl/pull/7917)
-  ("feat: add a profiler_markers() platform hook and share the attention
-  padding helpers"), merged into verl-core `main` on 2026-10-08. Against an
-  older checkout, `PlatformBase` has no such method to override, so ITT
+- `profiler_markers()` was merged into verl-core `main` on 2026-10-08. Against
+  an older checkout, `PlatformBase` has no such method to override, so ITT
   ranges are not emitted — it falls back to nvtx or the generic no-op markers
-  instead of erroring. `#7917` also lifted the `tool_config` allowlist in
-  `engine_workers.py`; without it a `tool_config.vtune` entry is dropped. The
-  `VtuneProfiler` registration itself is pure monkeypatch and needs no core
-  change either way.
+  instead of erroring. That same change also lifted the `tool_config`
+  allowlist in `engine_workers.py`; without it a `tool_config.vtune` entry is
+  dropped. The `VtuneProfiler` registration itself is pure monkeypatch and
+  needs no core change either way.
 - **A VTune collector must be installed separately.** ITT is notify-only: the
   markers this plugin emits are handed to whatever collector has attached to the
   process, and are discarded when none has. The plugin side needs nothing beyond
   PyTorch's ITT bindings, which Intel's XPU wheels ship
   (`torch.profiler.itt.is_available()` is `True` on `torch 2.13.0+xpu`); the
-  collector is the `intel-vtune` oneAPI component, which the Docker image
-  proposed in [verl-project/verl#7371](https://github.com/verl-project/verl/pull/7371)
-  (`docker/intel_gpu/`, still open) does **not** include — its oneAPI install
-  is the compiler/runtime set (ccl, compiler, mkl, mpi, pti, …). Capturing a
-  trace therefore needs a host with VTune installed, and enough sampling
-  permission for the collection type you pick (`hotspots` reads
-  `perf_event_open`, so a container typically needs
+  collector is the `intel-vtune` oneAPI component, which a plain oneAPI
+  compiler/runtime install (ccl, compiler, mkl, mpi, pti, …) does **not**
+  include on its own. Capturing a trace therefore needs a host with VTune
+  installed, and enough sampling permission for the collection type you pick
+  (`hotspots` reads `perf_event_open`, so a container typically needs
   `kernel.perf_event_paranoid <= 2` or `CAP_PERFMON`).
-- Install `verl` (`main` includes #7917 as of 2026-10-08) and
+- Install `verl` (`main` includes `profiler_markers()` as of 2026-10-08) and
   `verl-hardware-plugin` in editable mode, and enable the plugin in Ray
   runtime:
 
@@ -103,8 +98,8 @@ what gets recorded) — the ITT ranges are emitted the same way either way.
 ## Troubleshooting
 
 - If `profiler.tool=vtune` appears to do nothing, confirm the running verl-core
-  build actually includes #7917 (merged 2026-10-08; see Prerequisites) — on an
-  older checkout this is a silent no-op, not an error.
+  build actually includes `profiler_markers()` (merged 2026-10-08; see
+  Prerequisites) — on an older checkout this is a silent no-op, not an error.
 - If no ITT ranges show up in VTune, confirm the process was launched *under* a
   VTune collector (`vtune -collect ... -- python ...`), not run standalone —
   standalone runs execute the same code but nothing is listening for the events.

@@ -111,11 +111,8 @@ Intel GPU attached.
 | Hardware (1-GPU) | Validated | Arc Pro B60: 51.2 s/step, 148.2 tok/s (batch 16, Qwen2.5-0.5B) |
 | Hardware (2-GPU) | Validated | Arc Pro B60 x2: 93.0 s/step at same batch size |
 | Multi-node | Work in Progress | — |
-| Profiler | Intel VTune (ITT) — Validated | `profiler_markers()` hook merged into verl-core `main` (#7917, 2026-10-08); VTune collector capture itself still untested, see [profiling.md](./profiling.md) |
+| Profiler | Intel VTune (ITT) — Validated | `profiler_markers()` hook merged into verl-core `main` on 2026-10-08; VTune collector capture itself still untested, see [profiling.md](./profiling.md) |
 
 ## Next Steps
 
-See `docker/intel_gpu/README.md` in
-[verl-project/verl#7371](https://github.com/verl-project/verl/pull/7371) (open,
-not yet merged) for a containerized environment with all of the above
-preconfigured.
+See [Profiling](./profiling.md) to capture an Intel VTune (ITT) trace.

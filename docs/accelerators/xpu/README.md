@@ -58,4 +58,3 @@ docs/accelerators/xpu/
 ## Related Documentation
 
 - [verl plugin system](../../development.md)
-- [Docker image for verl + Intel XPU](https://github.com/verl-project/verl/pull/7371) — `docker/intel_gpu/`, proposed in this open upstream PR
