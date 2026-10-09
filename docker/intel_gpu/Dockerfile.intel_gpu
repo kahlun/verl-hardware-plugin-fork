@@ -88,14 +88,14 @@ ARG IGDGMM_VERSION=22.10.0
 ARG LEVEL_ZERO_VERSION=1.28.2+u24.04
 
 # verl-core, pulled in at a pinned ref — NOT the local build context (that's
-# this plugin, see Layer 3). Until verl-project/verl#7917 (the PlatformBase
-# hooks is_reduce_avg_supported()/attention_utils_module()/profiler_markers()/
-# dist_profiler_cls() that this plugin's platform_xpu.py and profilers/
-# override) merges upstream, default to the fork+branch that actually has
-# them. Switch VERL_GIT_REPO to https://github.com/verl-project/verl.git and
-# VERL_REF to a released tag once #7917 lands.
-ARG VERL_GIT_REPO=https://github.com/kahlun/verl.git
-ARG VERL_REF=intel-xpu-plugin-e2e-vllm
+# this plugin, see Layer 3). verl-project/verl#7917 (the PlatformBase
+# profiler_markers() hook and shared attention padding helpers that this
+# plugin's platform_xpu.py/profilers/ build on) merged to upstream main on
+# 2026-10-08, so the fork+branch default is no longer needed. No release tag
+# contains it yet (last tag v0.9.1 predates the merge), so pin to main rather
+# than a tag for now; move VERL_REF to a released tag once one ships #7917.
+ARG VERL_GIT_REPO=https://github.com/verl-project/verl.git
+ARG VERL_REF=main
 
 WORKDIR /workspace
 
