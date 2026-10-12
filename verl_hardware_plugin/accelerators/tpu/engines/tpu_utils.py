@@ -19,10 +19,12 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
+import torch._dynamo
 import torch.distributed
 import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict
+from torch.distributed.tensor import DTensor
 
 from verl.utils import tensordict_utils as tu
 from verl.workers.config import TorchtitanEngineConfig
@@ -44,6 +46,8 @@ def extend_torchtitan_engine_config() -> None:
         ("use_splash_attention", Optional[bool], None),
         ("use_simple_fsdp", Optional[bool], None),
         ("tpu_eager_mode", Optional[str], None),
+        ("pad_to_length", bool, False),
+        ("pad_to_length_bucket", int, _DEFAULT_TPU_SEQ_BUCKET_SIZE),
     ]
     missing = [item for item in extras if item[0] not in TorchtitanEngineConfig.__dataclass_fields__]
     if not missing:
@@ -159,8 +163,6 @@ def configure_torch_compile_for_tpu(recompile_limit: int = 64) -> None:
     during ``init_model`` do not carry over to later Ray actor RPCs unless
     ``_config[name].default`` is updated too.
     """
-    import torch._dynamo
-
     entries = getattr(torch._dynamo.config, "_config", {})
 
     def _set(name: str, value: Any) -> None:
@@ -199,13 +201,27 @@ def splash_block_size_for(seq_len: int, max_block_size: int = 512, min_block_siz
     return 0
 
 
-def get_tpu_seq_bucket_size() -> int:
-    """Return the sequence length bucket multiple used on TPU to bound XLA compilations."""
-    try:
-        val = int(os.environ.get("VERL_TPU_SEQ_BUCKET_SIZE", _DEFAULT_TPU_SEQ_BUCKET_SIZE))
-        return val if val > 0 else _DEFAULT_TPU_SEQ_BUCKET_SIZE
-    except ValueError:
-        return _DEFAULT_TPU_SEQ_BUCKET_SIZE
+def get_tpu_seq_bucket_size(engine_config: Any = None) -> int:
+    """Return the sequence length bucket multiple used on TPU to bound XLA compilations.
+
+    Precedence:
+    1. ``VERL_TPU_SEQ_BUCKET_SIZE`` environment variable when set and positive.
+    2. ``engine_config.pad_to_length_bucket`` when ``engine_config.pad_to_length`` is enabled.
+    3. ``_DEFAULT_TPU_SEQ_BUCKET_SIZE`` (256).
+    """
+    env_raw = os.environ.get("VERL_TPU_SEQ_BUCKET_SIZE")
+    if env_raw is not None and env_raw.strip() != "":
+        try:
+            val = int(env_raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    if engine_config is not None and bool(getattr(engine_config, "pad_to_length", False)):
+        cfg_bucket = getattr(engine_config, "pad_to_length_bucket", None)
+        if isinstance(cfg_bucket, int) and cfg_bucket > 0:
+            return cfg_bucket
+    return _DEFAULT_TPU_SEQ_BUCKET_SIZE
 
 
 def bucket_length(length: int, bucket_size: Optional[int] = None) -> int:
@@ -270,7 +286,7 @@ def compute_global_batch_num_tokens(data: TensorDict, dp_group: Any, tp_size: in
     return batch_num_tokens.item()
 
 
-def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict]) -> None:
+def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict], bucket_size: Optional[int] = None) -> None:
     """Make every rank pad micro-batch ``i`` to the same packed length and response-length bucket.
 
     SimpleFSDP traces the all-gather/reduce-scatter into each compiled (``spmd_safe``) TransformerBlock, and
@@ -281,7 +297,7 @@ def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict]) -> No
     """
     if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
         return
-    bucket_size = get_tpu_seq_bucket_size()
+    step = bucket_size if bucket_size is not None and bucket_size > 0 else get_tpu_seq_bucket_size()
     lens: list[int] = []
     for mb in micro_batches:
         ids = mb["input_ids"]
@@ -290,7 +306,7 @@ def align_micro_batch_shapes_across_ranks(micro_batches: list[TensorDict]) -> No
         max_resp = (
             int(resp.offsets().diff().max().item()) if resp is not None and getattr(resp, "is_nested", False) else 0
         )
-        lens += [bucket_length(n_tokens, bucket_size), bucket_length(max_resp, bucket_size) if max_resp else 0]
+        lens += [bucket_length(n_tokens, step), bucket_length(max_resp, step) if max_resp else 0]
     lens_tensor = torch.tensor(lens, dtype=torch.int64)
     torch.distributed.all_reduce(lens_tensor, op=torch.distributed.ReduceOp.MAX)
     resolved_lens = lens_tensor.tolist()
@@ -504,7 +520,6 @@ class TPUSplashAttention(torch.nn.Module):
                 **kwargs,
             )
 
-        from torch.distributed.tensor import DTensor
         from torchtitan.experiments.tpu.kernels.splash_attention import splash_sdpa
         from torchtitan.models.common.attention import segment_ids_from_positions
 
@@ -603,19 +618,52 @@ def replace_varlen_attention_with_tpu_attention(modules: Any) -> int:
     return replaced
 
 
+def force_sum_reduction_on_all_fsdp_modules(modules: Any) -> int:
+    """Enable ``set_force_sum_reduction_for_comms(True)`` on every FSDP2-wrapped module.
+
+    ``tpu_dist`` does not implement ``ReduceOp.AVG`` or ``ReduceOp.PREMUL_SUM`` in
+    ``reduce_scatter`` / ``all_reduce``. When TorchTitan shards with FSDP2 (instead of
+    ``SimpleFSDP``), ``fully_shard`` wraps both individual ``TransformerBlock`` layers
+    and the root model, and ``enable_fsdp_gradient_division`` causes FSDP2's
+    ``_get_gradient_divide_factors`` to select ``ReduceOp.AVG`` / ``ReduceOp.PREMUL_SUM``
+    unless ``set_force_sum_reduction_for_comms(True)`` is set on each wrapped module.
+    No-op (returns 0) when ``SimpleFSDP`` or unsharded modules are used.
+    """
+    if modules is None:
+        return 0
+    model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
+    seen: set[int] = set()
+    count = 0
+    for root in model_list:
+        if not isinstance(root, torch.nn.Module):
+            continue
+        for mod in (root, *root.modules()):
+            if id(mod) in seen:
+                continue
+            seen.add(id(mod))
+            fn = getattr(mod, "set_force_sum_reduction_for_comms", None)
+            if callable(fn):
+                fn(True)
+                count += 1
+    if count:
+        logger.info("Enabled force_sum_reduction_for_comms on %d FSDP module(s) for TPU", count)
+    return count
+
+
 def pad_packed_inputs_for_tpu(
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     micro_batch: TensorDict,
     device: Any,
     build_attention_mask: bool = True,
+    bucket_size: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], int]:
     """Bucket-pad packed 1D sequences and optionally build a static 4D causal document mask on CPU before H2D transfer.
 
     With ``build_attention_mask=False`` (splash attention, which derives document boundaries
     from ``positions``) the dense mask is skipped and ``None`` is returned in its place.
     """
-    bucket_size = get_tpu_seq_bucket_size()
+    step = bucket_size if bucket_size is not None and bucket_size > 0 else get_tpu_seq_bucket_size()
     input_ids_cpu = input_ids.values().detach().cpu().unsqueeze(0)
     if position_ids.dim() == 3:
         position_ids_cpu = position_ids.values().detach().cpu().unsqueeze(1)
@@ -627,7 +675,7 @@ def pad_packed_inputs_for_tpu(
     orig_seq_len = int(input_ids_cpu.shape[1])
     # tpu_padded_seq_len: common length across ranks from align_micro_batch_shapes_across_ranks (SimpleFSDP).
     padded_seq_len = max(
-        bucket_length(orig_seq_len, bucket_size),
+        bucket_length(orig_seq_len, step),
         int(tu.get_non_tensor_data(data=micro_batch, key="tpu_padded_seq_len", default=0) or 0),
     )
     pad_len = padded_seq_len - orig_seq_len
@@ -664,7 +712,7 @@ def pad_packed_inputs_for_tpu(
         resp_lens = micro_batch["responses"].offsets().diff().cpu()
         raw_max_resp = int(resp_lens.max().item())
         max_resp = max(
-            bucket_length(raw_max_resp, bucket_size),
+            bucket_length(raw_max_resp, step),
             int(tu.get_non_tensor_data(data=micro_batch, key="tpu_max_response_len", default=0) or 0),
         )
         tu.assign_non_tensor_data(micro_batch, "max_response_len", max_resp)
@@ -676,3 +724,77 @@ def pad_packed_inputs_for_tpu(
         attention_mask_cpu.to(device=device).contiguous() if attention_mask_cpu is not None else None,
         orig_seq_len,
     )
+
+
+class _TPUPaddedJaggedProxy:
+    """Lightweight proxy exposing a 1D bucket-padded TPU tensor via ``.values()``."""
+
+    def __init__(self, padded_values: torch.Tensor, base_nested: Any):
+        self._padded_values = padded_values
+        self._base_nested = base_nested
+        self.is_nested = True
+
+    def values(self) -> torch.Tensor:
+        return self._padded_values
+
+    def offsets(self) -> torch.Tensor:
+        return self._base_nested.offsets()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base_nested, name)
+
+
+class _TPULossDataProxy:
+    """Read-only view over a micro-batch ``TensorDict`` that overrides specific keys for loss calculation."""
+
+    def __init__(self, base: TensorDict, overrides: dict[str, Any]):
+        self._base = base
+        self._overrides = overrides
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self._overrides:
+            return self._overrides[key]
+        return self._base[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self._overrides:
+            return self._overrides[key]
+        return self._base.get(key, default)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._overrides or key in self._base
+
+    def keys(self):
+        return self._base.keys()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+
+def prepare_tpu_loss_inputs(model_output: dict[str, Any], micro_batch: TensorDict) -> tuple[dict[str, Any], Any]:
+    """Adapt ``(model_output, micro_batch)`` so unmodified ``verl.workers.utils.losses.sft_loss``
+    consumes the static bucket-padded TPU ``log_probs`` and a matching bucket-padded ``loss_mask``.
+    """
+    log_prob = model_output.get("log_probs")
+    tpu_padded_log_prob = getattr(log_prob, TPU_PADDED_VALUES_ATTR, None)
+    if tpu_padded_log_prob is None:
+        return model_output, micro_batch
+
+    if "loss_mask" not in micro_batch.keys() or "responses" in micro_batch.keys():
+        return model_output, micro_batch
+
+    loss_mask = micro_batch["loss_mask"]
+    loss_mask_vals = loss_mask.values() if getattr(loss_mask, "is_nested", False) else loss_mask
+    rolled_mask = torch.roll(loss_mask_vals.detach().cpu(), shifts=-1, dims=0)
+    target_len = int(tpu_padded_log_prob.shape[0])
+    if rolled_mask.shape[0] < target_len:
+        rolled_mask = F.pad(rolled_mask, (0, target_len - int(rolled_mask.shape[0])), value=0)
+    prerolled_mask = torch.roll(rolled_mask, shifts=1, dims=0).to(device=tpu_padded_log_prob.device).contiguous()
+
+    loss_model_output = dict(model_output)
+    loss_model_output["log_probs"] = _TPUPaddedJaggedProxy(tpu_padded_log_prob, log_prob)
+    loss_data = _TPULossDataProxy(
+        micro_batch,
+        {"loss_mask": _TPUPaddedJaggedProxy(prerolled_mask, loss_mask)},
+    )
+    return loss_model_output, loss_data

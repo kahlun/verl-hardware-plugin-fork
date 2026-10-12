@@ -24,6 +24,7 @@ import torch
 from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import extend_torchtitan_engine_config
+from verl_hardware_plugin.accelerators.tpu.patches import reduce_avg_allreduce_patch
 
 extend_torchtitan_engine_config()
 
@@ -329,6 +330,80 @@ def patch_ray_worker() -> None:
         logger.warning(f"Failed to apply Ray worker accelerator patch: {e}")
 
 
+def configure_torchrun_tpu_env() -> None:
+    """Populate PJRT multi-process environment variables when launched via ``torchrun``.
+
+    In Ray single-controller runs (``sft_trainer_ray`` / ``main_ppo``), ``get_worker_env_vars``
+    populates ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` and the topology bounds on each worker actor.
+    In ``torchrun`` multi-controller runs (``verl.trainer.sft_trainer``), ``PlatformTPU()`` is
+    instantiated inside ``auto_set_device`` / ``initialize_global_process_group`` before
+    ``torch.distributed.init_process_group(backend="cpu:gloo,tpu:tpu_dist")`` runs. Setting
+    missing PJRT variables from ``LOCAL_RANK`` / ``RANK`` / ``WORLD_SIZE`` lets ``torchrun``
+    work out of the box without a wrapper script.
+    """
+    if "LOCAL_RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        return
+    if "TORCH_TPU_SLICEBUILDER_ADDRESSES" in os.environ:
+        return
+    try:
+        if ray.is_initialized():
+            return
+    except Exception:
+        pass
+
+    try:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        rank = int(os.environ.get("RANK", local_rank))
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
+    except ValueError:
+        return
+
+    if world_size < 1 or local_world_size < 1:
+        return
+
+    num_nodes = max(1, world_size // local_world_size)
+    raw_hosts = os.environ.get("TPU_WORKER_HOSTNAMES")
+    if raw_hosts:
+        hostnames = [h.strip() for h in raw_hosts.split(",") if h.strip()]
+    elif num_nodes == 1:
+        hostnames = [os.environ.get("MASTER_ADDR", "127.0.0.1")]
+    else:
+        return
+
+    if len(hostnames) != num_nodes:
+        return
+
+    sb_addresses = [
+        f"{hostnames[r // local_world_size]}:{TPU_PROCESS_BASE_PORT + (r % local_world_size)}"
+        for r in range(world_size)
+    ]
+
+    os.environ.setdefault("PJRT_DEVICE", "TPU")
+    os.environ.setdefault("TORCH_TPU_SLICEBUILDER_ADDRESSES", ",".join(sb_addresses))
+    os.environ.setdefault("TPU_PROCESS_ADDRESSES", ",".join(sb_addresses))
+    os.environ.setdefault("TPU_PROCESS_PORT", str(TPU_PROCESS_BASE_PORT + local_rank))
+    os.environ.setdefault("CLOUD_TPU_TASK_ID", str(rank // local_world_size))
+    os.environ.setdefault("TPU_WORKER_HOSTNAMES", ",".join(hostnames))
+    os.environ.setdefault("TPU_VISIBLE_CHIPS", str(local_rank))
+
+    pod_type = (
+        os.environ.get("TPU_ACCELERATOR_TYPE") or os.environ.get("ACCELERATOR_TYPE") or os.environ.get("TPU_TYPE") or ""
+    )
+    try:
+        topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
+            total_chips=world_size,
+            num_nodes=num_nodes,
+            pod_type=pod_type,
+        )
+        os.environ.setdefault("TORCH_TPU_TOPOLOGY", topology)
+        os.environ.setdefault("TPU_HOST_BOUNDS", host_bounds)
+        os.environ.setdefault("TPU_CHIPS_PER_HOST_BOUNDS", chips_per_host_bounds)
+        os.environ.setdefault("CHIPS_PER_HOST", chips_per_host)
+    except ValueError:
+        pass
+
+
 @PlatformRegistry.register(platform="tpu")
 class PlatformTPU(PlatformBase):
     """Platform backend for Google TPUs.
@@ -340,6 +415,8 @@ class PlatformTPU(PlatformBase):
 
     def __init__(self):
         super().__init__()
+        reduce_avg_allreduce_patch.apply()
+        configure_torchrun_tpu_env()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         self._device_module = TPUDeviceModuleProxy(original_tpu)
         self._claimed_slices: set[str] = set()

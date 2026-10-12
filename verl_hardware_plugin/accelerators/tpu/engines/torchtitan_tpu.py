@@ -28,6 +28,7 @@ from typing import Callable
 
 import torch
 from tensordict import TensorDict
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 
 from verl.trainer.config import CheckpointConfig
@@ -54,7 +55,10 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     compute_global_batch_num_tokens,
     configure_torch_compile_for_tpu,
     extend_torchtitan_engine_config,
+    force_sum_reduction_on_all_fsdp_modules,
+    get_tpu_seq_bucket_size,
     pad_packed_inputs_for_tpu,
+    prepare_tpu_loss_inputs,
     replace_varlen_attention_with_tpu_attention,
     resolve_tpu_torchtitan_options,
     synchronize_tpu_loss,
@@ -84,8 +88,6 @@ class TPUEngineEvalModeCtx(BaseEngineCtx):
     def __exit__(self, exc_type, exc_value, traceback):
         assert isinstance(self.engine, TorchTitanEngine)
         if self.engine.engine_config.data_parallel_shard_size > 1:
-            from torch.distributed.fsdp import FSDPModule
-
             for module in self.engine.module:
                 for submodule in module.modules():
                     if isinstance(submodule, FSDPModule):
@@ -129,6 +131,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
             super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
 
         model_parts = getattr(self.trainer, "model_parts", None)
+        force_sum_reduction_on_all_fsdp_modules(model_parts)
         if self._use_splash_attention:
             apply_splash_attention_tpu(model_parts)
         else:
@@ -179,6 +182,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
         """Initialize model/checkpointer and release unused optimizer state on forward-only reference workers."""
         super().initialize()
         self._drop_checkpoint_state_dict_cache()
+        force_sum_reduction_on_all_fsdp_modules(self.module)
         if self._use_splash_attention:
             apply_splash_attention_tpu(self.module)
         else:
@@ -206,7 +210,9 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
             same_micro_num_in_dp=True,
         )
         if self._use_simple_fsdp:
-            align_micro_batch_shapes_across_ranks(micro_batches)
+            align_micro_batch_shapes_across_ranks(
+                micro_batches, bucket_size=get_tpu_seq_bucket_size(self.engine_config)
+            )
 
         output_lst = []
         ctx = torch.no_grad() if forward_only else nullcontext()
@@ -303,6 +309,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
         position_ids = micro_batch["position_ids"]
         output_args = {}
 
+        bucket_size = get_tpu_seq_bucket_size(self.engine_config)
         if use_remove_padding:
             input_ids, position_ids, labels, attention_mask, orig_seq_len = pad_packed_inputs_for_tpu(
                 input_ids=input_ids,
@@ -310,13 +317,14 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
                 micro_batch=micro_batch,
                 device=get_device_id(),
                 build_attention_mask=not self._use_splash_attention,
+                bucket_size=bucket_size,
             )
             output_args["orig_seq_len"] = orig_seq_len
         else:
             loss_mask = micro_batch["loss_mask"]
             pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
             batch_size = micro_batch.batch_size[0]
-            max_seq_len = bucket_length(int(max(input_ids.offsets().diff())))
+            max_seq_len = bucket_length(int(max(input_ids.offsets().diff())), bucket_size=bucket_size)
 
             labels = torch.roll(input_ids.values(), shifts=-1, dims=0).to(get_device_id())
             input_ids = torch.nested.to_padded_tensor(
@@ -464,8 +472,9 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
             model_output = self.prepare_model_outputs(logits=logits, output_args=output_args, micro_batch=micro_batch)
 
             if loss_function is not None:
+                loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
                 loss, metrics = loss_function(
-                    model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
+                    model_output=loss_model_output, data=loss_data, dp_group=self.get_data_parallel_group()
                 )
             else:
                 assert forward_only, "loss_function must be provided when not forward_only"
