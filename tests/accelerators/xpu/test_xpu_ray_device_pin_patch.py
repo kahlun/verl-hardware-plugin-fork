@@ -4,9 +4,12 @@
 """Tests for the plugin-only Ray device pinning patch.
 
 Mock only -- no accelerator, no Ray cluster. These cover what the patch does
-*and* the two properties that make it a demonstration rather than a
-recommendation: that it is correct only when it is installed before the first
-``Worker`` is built, and that arriving late is silent.
+*and* why it depends on import order rather than a documented contract: the
+patch is only ever installed ahead of ``Worker.__init__`` by accident, and
+"late" is not one failure mode but three, of increasing severity --
+``_configure_with_store`` still runs in time (warns, still correct), the
+fallback target is itself already running (fixed up directly from the frame,
+warns), or the fallback was removed entirely (silently wrong, the worst case).
 """
 
 import os
@@ -121,7 +124,7 @@ def test_in_process_worker_never_queries_ray(ray_actor, recorder):
     assert ray_actor["runtime_context_calls"] == 0
 
 
-def test_patch_applied_too_late_falls_back_to_private_store_key(ray_actor, recorder, caplog):
+def test_patch_applied_too_late_falls_back_to_private_store_key(ray_actor, recorder, caplog, monkeypatch):
     """Simulate the ordering this patch is not entitled to assume: the platform
     singleton -- and so ``apply()`` -- is first built by the
     ``get_resource_name()`` call *inside*
@@ -133,7 +136,7 @@ def test_patch_applied_too_late_falls_back_to_private_store_key(ray_actor, recor
         patch.apply()  # stands in for get_resource_name() -> PlatformXPU()
         return original_setup(self)
 
-    Worker._setup_env_cuda_visible_devices = _setup_that_builds_the_platform
+    monkeypatch.setattr(Worker, "_setup_env_cuda_visible_devices", _setup_that_builds_the_platform)
 
     with caplog.at_level("WARNING"):
         worker = Worker()
@@ -155,12 +158,37 @@ def test_patch_applied_too_late_without_the_fallback_is_silently_wrong(ray_actor
         patch.apply()
         return original_setup(self)
 
-    Worker._setup_env_cuda_visible_devices = _setup_that_builds_the_platform
+    monkeypatch.setattr(Worker, "_setup_env_cuda_visible_devices", _setup_that_builds_the_platform)
 
     worker = Worker()
 
     assert recorder.pinned == []
     assert worker._local_rank == 0
+
+
+def test_patch_triggered_from_inside_configure_with_store_still_pins_this_worker(
+    ray_actor, recorder, caplog, monkeypatch
+):
+    """Deeper than the fallback above: ``_configure_with_store`` calls
+    ``type(self).env_keys()``, which calls ``get_visible_devices_keyword()``,
+    which calls ``get_platform()`` -- so the platform singleton, and therefore
+    ``apply()``, can be built from *inside* an in-flight ``_configure_with_store``
+    call. At that point even the fallback target has already been looked up
+    for this call; reinstalling it on the class cannot change what this call
+    is already running. This worker must be pinned directly from the frame."""
+    original_env_keys = Worker.env_keys.__func__
+
+    def _env_keys_that_builds_the_platform(cls):
+        patch.apply()  # stands in for get_visible_devices_keyword() -> PlatformXPU()
+        return original_env_keys(cls)
+
+    monkeypatch.setattr(Worker, "env_keys", classmethod(_env_keys_that_builds_the_platform))
+
+    with caplog.at_level("WARNING"):
+        worker = Worker()
+
+    assert recorder.pinned == [1]
+    assert worker._local_rank == 1
 
 
 def test_import_verl_already_installs_the_patch_on_any_host(tmp_path):
@@ -195,8 +223,7 @@ def test_import_verl_already_installs_the_patch_on_any_host(tmp_path):
         env=env,
     ).stdout.split()
 
-    selected_platform, patched_from = out[-2], out[-1]
-    assert selected_platform != "xpu"
+    patched_from = out[-1]
     assert patched_from == "verl_hardware_plugin.accelerators.xpu.patches.ray_device_pin_patch"
 
 

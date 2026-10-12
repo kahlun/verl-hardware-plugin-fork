@@ -30,7 +30,15 @@ Patch target is selected automatically at install time:
   check), meaning the preferred target already ran for this instance.
   Writes ``store["_local_rank"]`` directly instead.
 
-Both targets are private core API. ``_reset()`` is for tests only.
+- In-flight ``_configure_with_store`` call (second-order fallback). That
+  method's own ``env_keys()`` call can be what builds the platform singleton,
+  meaning ``apply()`` runs while this method is already executing for this
+  worker. Installing the fallback on the class does not change a call
+  already in progress, so this worker is instead fixed up directly from its
+  call frame before the class-level fallback above is installed for later
+  workers.
+
+Both core targets are private API. ``_reset()`` is for tests only.
 """
 
 import logging
@@ -99,12 +107,62 @@ def _worker_init_running() -> bool:
     return False
 
 
+def _configure_with_store_frame() -> Optional[FrameType]:
+    """The in-flight ``Worker._configure_with_store`` frame, if any.
+
+    ``_configure_with_store`` calls ``type(self).env_keys()``, which calls
+    ``get_visible_devices_keyword()``, which calls ``get_platform()`` -- so
+    the platform singleton can be built from inside this method's own call,
+    after it has already started running. Reinstalling the method on the
+    class at that point does not change what this call is already executing.
+    """
+    from verl.single_controller.base.worker import Worker
+
+    target = Worker._configure_with_store.__code__
+    frame: Optional[FrameType] = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code is target:
+            return frame
+        frame = frame.f_back
+    return None
+
+
+def _pin_in_flight_configure_call(frame: FrameType) -> None:
+    """Fix up a ``_configure_with_store`` call that is already running.
+
+    Mutates ``store`` before the caller's dict comprehension reads
+    ``store["_local_rank"]``, since ``env_keys()`` -- the only thing that can
+    have triggered this -- runs before that comprehension's body does.
+    """
+    if not _xpu_selected():
+        return
+    store = frame.f_locals.get("store")
+    if store is None:
+        return
+    index = _ray_physical_index()
+    if index is None:
+        return
+    store["_local_rank"] = index
+    _device_module().set_device(index)
+    logger.warning(
+        "[verl_hardware_plugin] Pinned xpu:%d in-flight: apply() was triggered from inside an "
+        "already-running Worker._configure_with_store call (via env_keys() -> get_platform()), after "
+        "_setup_env_cuda_visible_devices had already run without pinning. Patched this call's store "
+        "directly; later workers in this process use the class-level patch installed below.",
+        index,
+    )
+
+
 def apply() -> None:
     global _applied
     if _applied:
         return
 
     from verl.single_controller.base.worker import Worker
+
+    configure_frame = _configure_with_store_frame()
+    if configure_frame is not None:
+        _pin_in_flight_configure_call(configure_frame)
 
     late = _worker_init_running()
 
