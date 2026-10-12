@@ -12,9 +12,9 @@ regardless of the mask, putting every rank on ``xpu:0``. The collision does
 not raise; it surfaces as OOM or as collectives taking a shared-device path.
 
 This module patches ``Worker`` from the plugin side, with no verl-core
-change. See ``docs/design/XPU_RAY_DEVICE_PIN_PLUGIN_ONLY.md`` for the
-core-side alternative (``PlatformBase.ray_device_index()``,
-verl-project/verl#8145).
+change. The core-side alternative is ``PlatformBase.ray_device_index()``,
+proposed in verl-project/verl#8145; this module exists to show what plugin-
+only pinning costs relative to that hook, not to replace it.
 
 Patch target is selected automatically at install time:
 
@@ -36,6 +36,7 @@ Both targets are private core API. ``_reset()`` is for tests only.
 import logging
 import os
 import sys
+from collections.abc import Callable
 from types import FrameType
 from typing import Optional
 
@@ -47,7 +48,7 @@ _applied = False
 # Saved so _reset() can restore them. apply() can run from a platform
 # detection probe on a host where XPU is not the selected platform, so
 # "installed" and "active" are tracked separately via _xpu_selected().
-_originals = {}
+_originals: dict[str, Callable] = {}
 
 
 def _xpu_selected() -> bool:
