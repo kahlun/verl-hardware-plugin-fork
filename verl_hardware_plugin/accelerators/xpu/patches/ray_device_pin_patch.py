@@ -4,47 +4,34 @@
 """Pin each Ray-launched XPU worker to the physical device Ray assigned it.
 
 ``Worker._setup_env_cuda_visible_devices()`` only calls ``set_device()`` when
-a ``RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES`` env var is set. By default verl
-relies on Ray's per-actor visibility mask to make index 0 the correct device.
-torch-xpu discards ``ZE_AFFINITY_MASK`` after lazy init, so every actor
-enumerates all physical devices and ``xpu:N`` resolves to physical device N
-regardless of the mask, putting every rank on ``xpu:0``. The collision does
-not raise; it surfaces as OOM or as collectives taking a shared-device path.
+a ``RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES`` var is set. By default verl
+relies on Ray's per-actor visibility mask, but torch-xpu discards
+``ZE_AFFINITY_MASK`` after lazy init, so every actor enumerates all physical
+devices and ``xpu:N`` resolves to physical device N regardless of the mask --
+every rank lands on ``xpu:0``. The collision does not raise; it surfaces
+later as OOM or as collectives silently sharing a device.
 
-This module patches ``Worker`` from the plugin side, with no verl-core
-change. The core-side alternative is ``PlatformBase.ray_device_index()``,
-proposed in verl-project/verl#8145; this module exists to show what plugin-
-only pinning costs relative to that hook, not to replace it.
+Patches ``Worker`` from the plugin side; the core-side alternative is
+``PlatformBase.ray_device_index()`` (verl-project/verl#8145).
 
-Patch target is selected automatically at install time:
+Which target ``apply()`` patches depends on timing relative to
+``Worker.__init__``:
 
-- ``Worker._setup_env_cuda_visible_devices`` (preferred). Wraps the method:
-  calls through to core's implementation, then pins the physical device via
-  ``ray.get_runtime_context().get_accelerator_ids()``. Installed from
-  ``PlatformXPU.__init__``, which runs before any ``Worker`` is constructed
-  because this plugin's ``register_all_engines()`` imports a core engine
-  module whose module body builds the platform singleton as a side effect.
-
-- ``Worker._configure_with_store`` (fallback). Used when ``apply()`` is
-  itself invoked from inside ``Worker.__init__`` (detected via a call-stack
-  check), meaning the preferred target already ran for this instance.
-  Writes ``store["_local_rank"]`` directly instead.
-
-- In-flight ``_configure_with_store`` call (second-order fallback). That
-  method's own ``env_keys()`` call can be what builds the platform singleton,
-  meaning ``apply()`` runs while this method is already executing for this
-  worker. Installing the fallback on the class does not change a call
-  already in progress, so this worker is instead fixed up directly from its
-  call frame before the class-level fallback above is installed for later
-  workers. This path cannot call ``_xpu_selected()`` or
-  ``get_resource_name()``: both resolve the platform singleton that is still
-  under construction on the stack above it, so either recurses into that
-  construction again. It checks ``torch.xpu`` directly and reads Ray's
-  accelerator ids under the literal ``"GPU"`` key instead -- and, because
-  hardware presence does not prove XPU will be *selected*, it only acts when
-  ``VERL_PLATFORM=intel`` is set explicitly (the one case core resolves
-  without probing); otherwise it leaves the worker unpinned rather than
-  guess on a mixed-hardware host.
+- Before it (the usual case: ``PlatformXPU.__init__`` runs during
+  ``import verl``, ahead of any ``Worker``): wraps
+  ``Worker._setup_env_cuda_visible_devices``.
+- From inside ``Worker.__init__``, after that method already ran: wraps
+  ``Worker._configure_with_store`` instead, writing ``store["_local_rank"]``
+  directly.
+- From inside an in-flight ``_configure_with_store`` call (its own
+  ``env_keys()`` can trigger platform construction): neither wrap can still
+  take effect for this worker, so it is patched directly from the call
+  frame. The platform singleton is itself under construction on the stack
+  above at this point, so this path can't call anything that resolves it
+  (``_xpu_selected()``, ``get_resource_name()``) without recursing; it
+  checks ``torch.xpu`` directly and only pins when ``VERL_PLATFORM=intel``
+  is set, leaving the worker unpinned otherwise rather than guess on a
+  mixed-hardware host.
 
 Both core targets are private API. ``_reset()`` is for tests only.
 """
@@ -84,18 +71,8 @@ def _device_module():
 
 
 def _xpu_hardware_present() -> bool:
-    """Direct ``torch.xpu`` check that never touches ``get_platform()``.
-
-    Used only by the in-flight fallback below, which runs while a
-    ``PlatformXPU`` instance is still under construction -- i.e. before
-    ``verl``'s platform singleton exists. ``_xpu_selected()`` calls
-    ``get_platform()``, which would re-enter that same still-unfinished
-    construction and recurse until ``RecursionError``.
-
-    Hardware being present is necessary but not sufficient: it does not mean
-    XPU is the platform about to be selected. See
-    ``_xpu_confirmed_selected_without_detection``.
-    """
+    """Direct ``torch.xpu`` check for the in-flight fallback, which cannot
+    call ``_xpu_selected()`` (would recurse into platform construction)."""
     try:
         import torch
 
@@ -105,28 +82,12 @@ def _xpu_hardware_present() -> bool:
 
 
 def _xpu_confirmed_selected_without_detection() -> bool:
-    """Whether this process is *certain* to select XPU, without detection.
-
-    True only when ``VERL_PLATFORM`` is explicitly set to ``"intel"``. In
-    core's ``_detect_platform_name()`` that is a plain ``os.environ`` read
-    that returns immediately, before any platform is probed or
-    constructed -- safe to duplicate here because it cannot recurse.
-
-    Returning False does *not* mean XPU will lose: with ``VERL_PLATFORM``
-    unset, core's auto-detection probes every registered platform in turn,
-    constructing a throwaway ``PlatformXPU()`` as one candidate among
-    several. ``apply()`` fires on that construction exactly as it does for
-    the real one, and at that point in the probe loop there is no way to
-    tell -- without recursing into the detection still running on the stack
-    above us -- whether this candidate will go on to win or lose. Mixed-
-    hardware hosts (XPU present but a different platform ultimately wins)
-    make guessing here unsafe: it would pin a worker to XPU, including a
-    ``torch.xpu.set_device()`` call, for a run that is not using XPU. So the
-    in-flight fallback only acts in the one case this function can answer
-    with certainty, and leaves the worker unpinned otherwise -- the same
-    outcome as "late, with no fallback installed" (silently uncorrected;
-    the run fails later, out of memory, rather than here).
-    """
+    """Whether ``VERL_PLATFORM=intel`` is set -- the one selection outcome
+    core resolves with a plain env read, before any platform is probed or
+    constructed. False does not mean XPU loses, only that the in-flight
+    fallback can't tell without recursing into the detection still running
+    above it on the stack, and so leaves the worker unpinned rather than
+    guess on a mixed-hardware host."""
     return os.environ.get("VERL_PLATFORM", "").strip().lower() == "intel"
 
 
@@ -150,16 +111,11 @@ def _ray_physical_index():
 
 
 def _ray_physical_index_no_platform_lookup():
-    """Same as ``_ray_physical_index()``, without ``get_resource_name()``.
-
-    ``get_resource_name()`` is ``get_platform().ray_resource_name()`` --
-    another path into the same still-under-construction singleton as
-    ``_xpu_selected()`` (see ``_xpu_hardware_present``). Used only by the
-    in-flight fallback, where that call would recurse. Reads Ray's
-    accelerator ids under the literal ``"GPU"`` key instead, which is not a
-    guess: ``PlatformXPU.ray_resource_name()`` always returns ``"GPU"`` (it
-    reuses Ray's built-in GPU resource rather than a custom one).
-    """
+    """Same as ``_ray_physical_index()``, for the in-flight fallback: reads
+    Ray's accelerator ids under the literal ``"GPU"`` key instead of calling
+    ``get_resource_name()`` (= ``get_platform().ray_resource_name()``,
+    recursive here). Not a guess -- ``PlatformXPU.ray_resource_name()`` is
+    hardcoded to ``"GPU"``."""
     import ray
 
     if not ray.is_initialized():
@@ -185,14 +141,9 @@ def _worker_init_running() -> bool:
 
 
 def _configure_with_store_frame() -> Optional[FrameType]:
-    """The in-flight ``Worker._configure_with_store`` frame, if any.
-
-    ``_configure_with_store`` calls ``type(self).env_keys()``, which calls
-    ``get_visible_devices_keyword()``, which calls ``get_platform()`` -- so
-    the platform singleton can be built from inside this method's own call,
-    after it has already started running. Reinstalling the method on the
-    class at that point does not change what this call is already executing.
-    """
+    """The in-flight ``Worker._configure_with_store`` frame, if any -- its
+    ``env_keys() -> get_platform()`` can trigger platform construction mid-call,
+    too late for reinstalling the method on the class to affect this call."""
     from verl.single_controller.base.worker import Worker
 
     target = Worker._configure_with_store.__code__

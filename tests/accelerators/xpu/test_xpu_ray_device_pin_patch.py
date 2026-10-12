@@ -37,15 +37,31 @@ def recorder(monkeypatch):
     monkeypatch.setattr(patch, "_xpu_selected", lambda: True)
     monkeypatch.setattr(patch, "_xpu_hardware_present", lambda: True)
 
-    # Start from pristine core. This is not test hygiene for its own sake: on
-    # this CPU-only host, with no XPU and "nvidia" the selected platform,
-    # ``import verl`` has *already* installed this patch on core's ``Worker``
-    # -- platform detection constructs ``PlatformXPU()`` to probe it, and
-    # ``PlatformXPU.__init__`` is where the patch is applied. Only the call-time
-    # ``_xpu_selected()`` check keeps it inert in a real run.
+    from verl.single_controller.base.worker import Worker
+
+    # Snapshot the real pre-test state before resetting to pristine below, so
+    # teardown can restore it exactly. On this CPU-only host, with no XPU and
+    # "nvidia" the selected platform, ``import verl`` has *already* installed
+    # this patch on core's ``Worker`` -- platform detection constructs
+    # ``PlatformXPU()`` to probe it, and ``PlatformXPU.__init__`` is where the
+    # patch is applied. Tearing down to ``patch._reset()``'s plain "pristine
+    # core" instead of this snapshot would leave ``Worker`` unpatched for
+    # every test running later in the same process, including outside this
+    # file -- the opposite of what ``import verl`` actually did.
+    pre_test_setup = Worker._setup_env_cuda_visible_devices
+    pre_test_configure = Worker._configure_with_store
+    pre_test_applied = patch._applied
+    pre_test_originals = dict(patch._originals)
+
     patch._reset()
     yield rec
     patch._reset()
+
+    Worker._setup_env_cuda_visible_devices = pre_test_setup
+    Worker._configure_with_store = pre_test_configure
+    patch._applied = pre_test_applied
+    patch._originals.clear()
+    patch._originals.update(pre_test_originals)
 
 
 @pytest.fixture

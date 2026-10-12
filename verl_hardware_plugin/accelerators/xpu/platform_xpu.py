@@ -78,30 +78,20 @@ class PlatformXPU(PlatformBase):
     """
 
     def __init__(self) -> None:
-        # Apply this platform's monkeypatch only now, when XPU is actually
-        # the platform verl selected for this process (verl.plugin.platform.
-        # platform_manager._create_platform() only constructs PlatformXPU()
-        # when platform detection -- explicit VERL_PLATFORM=intel or
-        # auto-detection -- picked "intel"). Applying it from the shared
-        # verl_hardware_plugin/__init__.py instead would fire on any host
-        # where XPU hardware/SDK merely happens to be present, even if a
-        # different platform ends up selected for this run -- e.g. a mixed
-        # host with VERL_PLATFORM=nvidia explicitly set would still get its
-        # process-wide torch.distributed.all_reduce(op=AVG) semantics
-        # changed for no reason.
+        # Applied here rather than from the shared verl_hardware_plugin/__init__.py
+        # so it only installs on hosts where XPU hardware is present, not on
+        # every host regardless of platform. apply() is a no-op without
+        # torch.xpu; the patched all_reduce wrapper itself gates on the xccl
+        # backend at call time, so a losing detection probe (see
+        # ray_device_pin_patch below) can't change its correctness.
         from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch
 
         reduce_avg_allreduce_patch.apply()
 
-        # Pin each Ray worker's XPU without a verl-core change. Unlike the AVG
-        # patch above, this one is only in time because the platform singleton
-        # happens to be built during ``import verl`` rather than from inside
-        # ``Worker.__init__``, and it re-checks the selected platform per call
-        # instead of here -- a detection probe can construct PlatformXPU() on a
-        # host where another platform wins. Read that module's docstring before
-        # relying on it: it is a demonstration of what plugin-only pinning
-        # costs, not a recommendation; the hook in verl-project/verl#8145
-        # replaces all of it.
+        # PlatformXPU() is also constructed as a detection probe on hosts
+        # where a different platform wins, so this call does not guarantee
+        # XPU is selected -- see ray_device_pin_patch's module docstring for
+        # how each of its patch targets accounts for that.
         from verl_hardware_plugin.accelerators.xpu.patches import ray_device_pin_patch
 
         ray_device_pin_patch.apply()
