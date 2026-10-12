@@ -17,8 +17,14 @@ verl (main framework)
     │
     └── entry_points: verl.plugins → verl_hardware_plugin
             │
-            ├── platforms/  → @PlatformRegistry.register(platform="vendor_name")
-            └── engines/    → @EngineRegistry.register(device=..., vendor=...)
+            ├── accelerators/<backend>/platform_*.py
+            │     → @PlatformRegistry.register(platform="vendor_name")
+            ├── accelerators/<backend>/engines/
+            │     → @EngineRegistry.register(device=..., vendor=...)
+            ├── integrations/flagos/engines/  → Cross-accelerator engines
+            ├── accelerators/<backend>/__init__.py → Register the platform
+            ├── accelerators/<backend>/registration.py → Register engines and hooks
+            └── __init__.py → One backend list and load_backends()
 ```
 
 The plugin integrates with verl through two registries:
@@ -27,12 +33,26 @@ The plugin integrates with verl through two registries:
 
 ### How Discovery Works
 
-verl discovers plugins through Python's `entry_points` mechanism. When verl starts, it imports all packages registered under the `verl.plugins` group. This triggers the `__init__.py` of the plugin package, which calls `register_all_platforms()` and `register_all_engines()` to fire all `@register` decorators.
+verl discovers plugins through Python's `entry_points` mechanism. When verl starts, it imports all packages registered under the `verl.plugins` group. This triggers the `__init__.py` of the plugin package, which calls `load_backends()`.
+
+The only central backend list is `BACKEND_MODULES` in the plugin's root
+`__init__.py`, containing backend package names. `load_backends()` first imports
+these packages: each accelerator's `__init__.py` registers only its platform, while
+integration package initializers remain inert. It then imports each package's
+`registration.py` for engines and optional profiler/rollout hooks. This ordering
+matters because upstream engine modules cache the selected device during import.
+There is no shared stage framework or separate list for each component type.
+
+Directly importing a backend's `registration.py` also initializes its parent
+package, registering the platform before its other components. Independent
+optional imports are guarded in each backend, and `load_backends()` also isolates
+failures between backends. Directory names do not change platform names, device
+types, or vendor registry keys.
 
 ```toml
 # pyproject.toml of this plugin
 [project.entry-points."verl.plugins"]
-verl_hardware_plugin = "verl_hardware_plugin"
+hardware = "verl_hardware_plugin"
 ```
 
 No manual configuration in verl is needed — just `pip install` the plugin package.
@@ -45,7 +65,11 @@ No manual configuration in verl is needed — just `pip install` the plugin pack
 
 ### Step 1: Create the Platform Class
 
-Create a new file under `verl_hardware_plugin/platforms/`, e.g. `platform_my_vendor.py`.
+Create a backend directory under `verl_hardware_plugin/accelerators/`, then add the
+platform file, e.g. `verl_hardware_plugin/accelerators/my_vendor/platform_my_vendor.py`.
+Add an `__init__.py` to the backend package to register the platform as shown in
+Step 2. Use the same layout for domestic and international accelerators, such as
+Intel XPU, Google TPU, or future AWS Trainium.
 
 Below is a **fully annotated template** — every method includes comments explaining what it does and why:
 
@@ -494,33 +518,44 @@ class PlatformMyDevice(PlatformBase):
         return None
 ```
 
-### Step 2: Register the Platform Module
+### Step 2: Register the Backend Once
 
-Add your platform to `verl_hardware_plugin/platforms/__init__.py`:
+In `verl_hardware_plugin/accelerators/my_vendor/__init__.py`, import only the
+platform implementation inside a guarded block. Its decorator registers the
+platform when available, before any backend's engines are loaded:
 
 ```python
-def register_all_platforms():
-    """Import all platform modules to trigger their @register decorators."""
+import logging
 
-    # ... existing platforms ...
+logger = logging.getLogger(__name__)
 
-    # MyVendor
-    try:
-        from verl_hardware_plugin.platforms import platform_my_vendor  # noqa: F401
-
-        logger.info("Registered platform: my_vendor")
-    except Exception as e:
-        logger.debug("MyVendor platform not registered: %s", e)
+try:
+    from . import platform_my_vendor  # noqa: F401
+except Exception as exc:
+    logger.debug("MyVendor platform registration unavailable: %s", exc)
 ```
 
-**Why try/except?** — The plugin package may be installed on machines without your hardware SDK. Conditional imports prevent import errors from affecting other platforms.
+Create `verl_hardware_plugin/accelerators/my_vendor/registration.py` for this
+backend's engines and optional profiler/rollout hooks. It can be empty if there
+are no such components. Do not import these components from the package
+initializer; engine imports may cache device selection before other platforms
+have registered.
+
+Add `"verl_hardware_plugin.accelerators.my_vendor"` once to
+`BACKEND_MODULES` in `verl_hardware_plugin/__init__.py`. No other central
+registration lists need to change. The loader imports this package before
+loading any backend's `registration` module.
+
+Keep independent components in separate guarded blocks so a missing optional
+SDK does not prevent the remaining components from registering. The root loader
+also catches registration module failures and continues with the next backend.
 
 ### Step 3: Create the Engine Class (Optional)
 
-If your hardware needs custom training behavior (e.g. different reduction ops, special initialization), create an engine file under `verl_hardware_plugin/engines/`:
+If your hardware needs custom training behavior (e.g. different reduction ops, special initialization), create an engine file under `verl_hardware_plugin/accelerators/my_vendor/engines/`:
 
 ```python
-# verl_hardware_plugin/engines/fsdp_my_vendor.py
+# verl_hardware_plugin/accelerators/my_vendor/engines/fsdp_my_vendor.py
 # Copyright (c) 2026 BAAI. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
@@ -611,17 +646,28 @@ class FSDPMyVendorEngineWithValueHead(FSDPEngineWithValueHead):
             self.model.set_force_sum_reduction_for_comms(True)
 ```
 
-Then register in `verl_hardware_plugin/engines/__init__.py`:
+Add the engine import to
+`accelerators/my_vendor/registration.py`:
 
 ```python
-# MyVendor engines
-try:
-    from verl_hardware_plugin.engines import fsdp_my_vendor  # noqa: F401
+import logging
 
-    logger.info("Registered engines: fsdp_my_vendor")
-except Exception as e:
-    logger.debug("MyVendor FSDP engines not registered: %s", e)
+logger = logging.getLogger(__name__)
+
+try:
+    from .engines import fsdp_my_vendor  # noqa: F401
+except Exception as exc:
+    logger.debug("MyVendor FSDP registration unavailable: %s", exc)
 ```
+
+Use separate guarded blocks for independent engines. Imports that must succeed
+together can share a block; if one fails, later imports in that block are skipped.
+
+Apply optional profiler patches or register rollout loaders from guarded blocks
+in this same file. Keep patches idempotent and install lazy rollout loaders
+without importing their inference runtime. See `accelerators/mlu/registration.py`
+and `accelerators/tpu/registration.py` for examples. Cross-accelerator integrations
+use the same import-time registration pattern under `integrations/<name>/registration.py`.
 
 ### Step 4: Test Registration
 
@@ -629,7 +675,7 @@ Run the registration test to verify everything loads correctly:
 
 ```bash
 pip install -e .
-pytest tests/test_plugin_registration.py -v
+pytest tests/test_registration_dispatch.py tests/test_plugin_registration.py -v
 ```
 
 You can also verify manually:
@@ -647,14 +693,17 @@ print(f'available: {p.is_available()}')
 
 ### Step 5: Add User Documentation
 
-Each hardware platform must have a corresponding user documentation directory `user_guide_<vendor>` under `docs/` for end-user reference.
+Each hardware platform must have a corresponding user documentation directory
+`docs/accelerators/<backend>/` matching its source package for end-user reference.
 
-Naming convention: `user_guide_<vendor>`, e.g. `user_guide_xpu`, `user_guide_mlu`, `user_guide_metax`, `user_guide_flagos`.
+Use backend names such as `xpu`, `mlu`, `metax`, and `tpu`. Software integrations
+that span multiple accelerator backends belong under `docs/integrations/`, such as
+`docs/integrations/flagos/`.
 
 Follow the structure of [verl/docs/ascend_tutorial](https://github.com/verl-project/verl/tree/main/docs/ascend_tutorial) when creating the documentation. Recommended contents:
 
 ```
-docs/user_guide_<vendor>/
+docs/accelerators/<backend>/
 ├── README.md              # Entry point: introduction, directory layout, platform summary
 ├── install_guidance.md    # Installation: prerequisites, install steps, environment verification
 ├── quick_start.md         # Quick start: basic validation scenario (e.g. Qwen2.5-0.5B GRPO)
@@ -685,11 +734,11 @@ docs/user_guide_<vendor>/
 - Diagnostic tools/commands
 
 Existing reference implementations:
-- `docs/user_guide_xpu/` — Intel XPU
-- `docs/user_guide_mlu/` — Cambricon MLU
-- `docs/user_guide_metax/` — MetaX
-- `docs/user_guide_flagos/` — FlagOS
-- `docs/user_guide_enflame/` — Enflame GCU
+- `docs/accelerators/xpu/` — Intel XPU
+- `docs/accelerators/mlu/` — Cambricon MLU
+- `docs/accelerators/metax/` — MetaX
+- `docs/integrations/flagos/` — FlagOS
+- `docs/accelerators/enflame/` — Enflame GCU
 
 > **Tip**: Refer to `verl/docs/ascend_tutorial` (Huawei NPU) for documentation quality and coverage expectations. That tutorial covers installation, quick start, advanced features, performance tuning, precision analysis, and FAQ.
 
@@ -856,7 +905,7 @@ self.model.set_force_sum_reduction_for_comms(True)
 
 **Cause**: Top-level imports of vendor SDK at module level.
 
-**Solution**: Use lazy imports inside method bodies, or guard top-level imports in a `_ensure_*()` helper function. The `register_all_platforms()` function already wraps imports in try/except.
+**Solution**: Use lazy imports inside method bodies, or guard top-level imports in a `_ensure_*()` helper function. Guard the platform import in the backend's `__init__.py`, and isolate independent component imports in `registration.py` with try/except so missing SDKs do not block other registrations.
 
 ---
 
@@ -866,28 +915,45 @@ self.model.set_force_sum_reduction_for_comms(True)
 verl-hardware-plugin/
 ├── pyproject.toml                         # Package config + entry_points
 ├── verl_hardware_plugin/
-│   ├── __init__.py                        # Entry point: register_all_*()
-│   ├── platforms/
-│   │   ├── __init__.py                    # register_all_platforms()
-│   │   ├── platform_xpu.py               # Intel XPU reference
-│   │   ├── platform_mlu.py               # Cambricon MLU reference
-│   │   ├── platform_cuda_metax.py        # MetaX reference
-│   │   └── platform_<vendor>.py          # Your new platform
-│   ├── engines/
-│   │   ├── __init__.py                    # register_all_engines()
-│   │   ├── fsdp_xpu.py                   # Intel FSDP reference
-│   │   ├── fsdp_mlu.py                   # Cambricon FSDP reference
-│   │   ├── fsdp_metax.py                 # MetaX FSDP reference
-│   │   ├── fsdp_<vendor>.py              # Your new FSDP engine
-│   │   └── megatron_<vendor>.py          # Your new Megatron engine (optional)
+│   ├── __init__.py                        # BACKEND_MODULES and load_backends()
+│   ├── accelerators/
+│   │   ├── xpu/                          # Intel XPU
+│   │   ├── mlu/                          # Cambricon MLU
+│   │   ├── metax/                        # MetaX
+│   │   ├── enflame/                      # Enflame GCU
+│   │   ├── iluvatar/                     # Iluvatar
+│   │   ├── musa/                         # Moore Threads MUSA
+│   │   ├── supa/                         # Biren SUPA
+│   │   ├── tpu/                          # Google TPU
+│   │   ├── trainium/                     # Reserved; no implementation or registration
+│   │   └── <backend>/                    # Each implemented backend owns these files
+│   │       ├── __init__.py               # Guarded platform registration only
+│   │       ├── registration.py           # Engine, profiler, and rollout registration
+│   │       ├── platform_<vendor>.py      # Platform implementation
+│   │       ├── engines/                  # FSDP, Megatron, checkpoint engines, etc.
+│   │       ├── rollout/                  # Optional rollout implementations
+│   │       ├── profilers/                # Optional hardware profilers
+│   │       ├── patches/                  # Optional hardware patches
+│   │       └── utils/                    # Optional hardware-specific helpers
+│   ├── integrations/
+│   │   └── flagos/                       # Cross-accelerator software integration
+│   │       ├── __init__.py               # Inert; no platform to register
+│   │       ├── registration.py           # Same import-time registration pattern
+│   │       └── engines/
 │   └── utils/
 │       ├── __init__.py
-│       └── config_manager.py
+│       └── config_manager.py             # Shared environment configuration
 ├── tests/
-│   └── test_plugin_registration.py
+│   ├── test_plugin_registration.py       # Shared registration checks
+│   ├── test_registration_dispatch.py     # SDK-free backend loading checks
+│   └── accelerators/<backend>/           # Hardware-specific tests
+├── scripts/
+│   ├── baseline_grpo_gsm8k.sh             # Shared acceptance baseline
+│   └── accelerators/enflame/             # Enflame baseline wrapper
 └── docs/
     ├── development.md                     # This file
-    └── user_guide.md                      # End-user documentation
+    ├── accelerators/<backend>/            # Hardware user guides
+    └── integrations/flagos/               # Cross-accelerator integration guides
 ```
 
 ---
@@ -898,10 +964,10 @@ The following files in this repository serve as examples:
 
 | Vendor | Platform File | Engine Files |
 |--------|--------------|--------------|
-| Intel XPU | `platforms/platform_xpu.py` | `engines/fsdp_xpu.py`, `engines/megatron_xpu.py` |
-| Cambricon MLU | `platforms/platform_mlu.py` | `engines/fsdp_mlu.py`, `engines/megatron_mlu.py` |
-| MetaX | `platforms/platform_cuda_metax.py` | `engines/fsdp_metax.py`, `engines/megatron_metax.py` |
-| Enflame GCU | `platforms/platform_enflame.py` | `engines/fsdp_enflame.py`, `engines/megatron_enflame.py` |
+| Intel XPU | `accelerators/xpu/platform_xpu.py` | `accelerators/xpu/engines/fsdp_xpu.py`, `accelerators/xpu/engines/megatron_xpu.py` |
+| Cambricon MLU | `accelerators/mlu/platform_mlu.py` | `accelerators/mlu/engines/fsdp_mlu.py`, `accelerators/mlu/engines/megatron_mlu.py` |
+| MetaX | `accelerators/metax/platform_cuda_metax.py` | `accelerators/metax/engines/fsdp_metax.py`, `accelerators/metax/engines/megatron_metax.py` |
+| Enflame GCU | `accelerators/enflame/platform_enflame.py` | `accelerators/enflame/engines/fsdp_enflame.py`, `accelerators/enflame/engines/megatron_enflame.py` |
 
 ---
 
@@ -1089,4 +1155,4 @@ branch in the Actions tab.
 - **Platform base class**: `verl/plugin/platform/platform_base.py`
 - **Engine base class**: `verl/workers/engine/base.py`
 - **Platform README**: `verl/plugin/platform/README.md`
-- **User Guide**: [docs/user_guide.md](user_guide.md)
+- **User Guides**: [Hardware and integration guides](../README.md#documentation)
