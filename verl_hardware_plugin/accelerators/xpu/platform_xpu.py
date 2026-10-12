@@ -89,9 +89,10 @@ class PlatformXPU(PlatformBase):
         # host with VERL_PLATFORM=nvidia explicitly set would still get its
         # process-wide torch.distributed.all_reduce(op=AVG) semantics
         # changed for no reason.
-        from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch
+        from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch, vl_attn_hub_kernels_patch
 
         reduce_avg_allreduce_patch.apply()
+        vl_attn_hub_kernels_patch.apply()
 
     # ------------------------------------------------------------------
     # Core device management
