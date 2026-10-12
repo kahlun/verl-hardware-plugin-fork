@@ -36,7 +36,10 @@ Patch target is selected automatically at install time:
   worker. Installing the fallback on the class does not change a call
   already in progress, so this worker is instead fixed up directly from its
   call frame before the class-level fallback above is installed for later
-  workers.
+  workers. This path cannot call ``_xpu_selected()``: the platform singleton
+  it would resolve is the very one still under construction on the stack
+  above it, so asking ``get_platform()`` recurses into that construction
+  again. It checks ``torch.xpu`` directly instead.
 
 Both core targets are private API. ``_reset()`` is for tests only.
 """
@@ -73,6 +76,23 @@ def _device_module():
     import torch
 
     return torch.xpu
+
+
+def _xpu_hardware_present() -> bool:
+    """Direct ``torch.xpu`` check that never touches ``get_platform()``.
+
+    Used only by the in-flight fallback below, which runs while a
+    ``PlatformXPU`` instance is still under construction -- i.e. before
+    ``verl``'s platform singleton exists. ``_xpu_selected()`` calls
+    ``get_platform()``, which would re-enter that same still-unfinished
+    construction and recurse until ``RecursionError``.
+    """
+    try:
+        import torch
+
+        return hasattr(torch, "xpu") and torch.xpu.is_available()
+    except Exception:  # pragma: no cover - torch not importable
+        return False
 
 
 def _ray_physical_index():
@@ -134,7 +154,7 @@ def _pin_in_flight_configure_call(frame: FrameType) -> None:
     ``store["_local_rank"]``, since ``env_keys()`` -- the only thing that can
     have triggered this -- runs before that comprehension's body does.
     """
-    if not _xpu_selected():
+    if not _xpu_hardware_present():
         return
     store = frame.f_locals.get("store")
     if store is None:

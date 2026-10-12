@@ -35,6 +35,7 @@ def recorder(monkeypatch):
     rec = _DeviceRecorder()
     monkeypatch.setattr(patch, "_device_module", lambda: rec)
     monkeypatch.setattr(patch, "_xpu_selected", lambda: True)
+    monkeypatch.setattr(patch, "_xpu_hardware_present", lambda: True)
 
     # Start from pristine core. This is not test hygiene for its own sake: on
     # this CPU-only host, with no XPU and "nvidia" the selected platform,
@@ -186,6 +187,36 @@ def test_patch_triggered_from_inside_configure_with_store_still_pins_this_worker
 
     with caplog.at_level("WARNING"):
         worker = Worker()
+
+    assert recorder.pinned == [1]
+    assert worker._local_rank == 1
+
+
+def test_in_flight_fallback_never_resolves_get_platform(ray_actor, recorder, monkeypatch):
+    """Regression test: ``get_platform()`` must never be called from the
+    in-flight fallback. At that point ``PlatformXPU`` is still under
+    construction, so the platform singleton it would resolve is the one
+    currently being built on the stack above it -- calling ``get_platform()``
+    (what ``_xpu_selected()`` does) recurses into that same construction and
+    grows the stack without bound until ``RecursionError``, which verl's own
+    detection loop can swallow via a bare ``except Exception``, silently
+    selecting the wrong platform instead of pinning this worker.
+    """
+
+    def _must_not_be_called():
+        raise AssertionError("in-flight fallback must not call _xpu_selected()/get_platform()")
+
+    monkeypatch.setattr(patch, "_xpu_selected", _must_not_be_called)
+
+    original_env_keys = Worker.env_keys.__func__
+
+    def _env_keys_that_builds_the_platform(cls):
+        patch.apply()
+        return original_env_keys(cls)
+
+    monkeypatch.setattr(Worker, "env_keys", classmethod(_env_keys_that_builds_the_platform))
+
+    worker = Worker()
 
     assert recorder.pinned == [1]
     assert worker._local_rank == 1
