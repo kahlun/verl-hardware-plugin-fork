@@ -76,3 +76,8 @@ def apply_vtune_profiler_patch() -> None:
     DistProfiler.__init__ = patched_init
     _PATCHED = True
     logger.debug("registered VtuneProfiler for profiler.tool='vtune'")
+
+
+# Alias so this module fits PlatformXPU's `_PATCHES` loop, which calls
+# `patch_module.apply()` uniformly across every entry.
+apply = apply_vtune_profiler_patch
