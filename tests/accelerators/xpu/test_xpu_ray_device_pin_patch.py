@@ -153,10 +153,16 @@ def test_patch_applied_too_late_falls_back_to_private_store_key(ray_actor, recor
         patch.apply()  # stands in for get_resource_name() -> PlatformXPU()
         return original_setup(self)
 
-    monkeypatch.setattr(Worker, "_setup_env_cuda_visible_devices", _setup_that_builds_the_platform)
-
-    with caplog.at_level("WARNING"):
-        worker = Worker()
+    # Scoped locally rather than via the shared `monkeypatch` fixture: `recorder`
+    # and `ray_actor` both depend on that fixture, so it is set up before them and
+    # torn down after them. Reverting through it here would run after `recorder`
+    # has already restored the real patched method, clobbering that restore back
+    # to pristine and leaking an unpatched Worker into every test that runs later
+    # in the same process.
+    with monkeypatch.context() as m:
+        m.setattr(Worker, "_setup_env_cuda_visible_devices", _setup_that_builds_the_platform)
+        with caplog.at_level("WARNING"):
+            worker = Worker()
 
     # Still correct, but only because of the second patch target.
     assert recorder.pinned == [1]
@@ -175,9 +181,11 @@ def test_patch_applied_too_late_without_the_fallback_is_silently_wrong(ray_actor
         patch.apply()
         return original_setup(self)
 
-    monkeypatch.setattr(Worker, "_setup_env_cuda_visible_devices", _setup_that_builds_the_platform)
-
-    worker = Worker()
+    # See the comment in test_patch_applied_too_late_falls_back_to_private_store_key:
+    # must be scoped locally, not via the shared `monkeypatch` fixture.
+    with monkeypatch.context() as m:
+        m.setattr(Worker, "_setup_env_cuda_visible_devices", _setup_that_builds_the_platform)
+        worker = Worker()
 
     assert recorder.pinned == []
     assert worker._local_rank == 0
