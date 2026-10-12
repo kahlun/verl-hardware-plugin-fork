@@ -39,6 +39,7 @@ Both core targets are private API. ``_reset()`` is for tests only.
 import logging
 import os
 import sys
+import threading
 from collections.abc import Callable
 from types import FrameType
 from typing import Optional
@@ -47,6 +48,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _applied = False
+_apply_lock = threading.Lock()
 
 # Saved so _reset() can restore them. apply() can run from a platform
 # detection probe on a host where XPU is not the selected platform, so
@@ -95,19 +97,26 @@ def _ray_physical_index():
     """Physical device index Ray assigned to this actor, or None.
 
     None covers in-process ``Worker`` construction with no Ray (e.g.
-    ``SFTTrainer._build_engine()`` under torchrun) and CPU-only actors.
+    ``SFTTrainer._build_engine()`` under torchrun), CPU-only actors, and any
+    unexpected error talking to Ray -- failing open (unpinned) rather than
+    raising out of ``Worker.__init__``, consistent with every other gating
+    helper in this module.
     """
-    import ray
+    try:
+        import ray
 
-    if not ray.is_initialized():
+        if not ray.is_initialized():
+            return None
+
+        from verl.utils.device import get_resource_name
+
+        accelerator_ids = ray.get_runtime_context().get_accelerator_ids().get(get_resource_name())
+        if not accelerator_ids:
+            return None
+        return int(accelerator_ids[0])
+    except Exception:
+        logger.warning("[verl_hardware_plugin] Could not read Ray's accelerator assignment", exc_info=True)
         return None
-
-    from verl.utils.device import get_resource_name
-
-    accelerator_ids = ray.get_runtime_context().get_accelerator_ids().get(get_resource_name())
-    if not accelerator_ids:
-        return None
-    return int(accelerator_ids[0])
 
 
 def _ray_physical_index_no_platform_lookup():
@@ -116,15 +125,19 @@ def _ray_physical_index_no_platform_lookup():
     ``get_resource_name()`` (= ``get_platform().ray_resource_name()``,
     recursive here). Not a guess -- ``PlatformXPU.ray_resource_name()`` is
     hardcoded to ``"GPU"``."""
-    import ray
+    try:
+        import ray
 
-    if not ray.is_initialized():
-        return None
+        if not ray.is_initialized():
+            return None
 
-    accelerator_ids = ray.get_runtime_context().get_accelerator_ids().get("GPU")
-    if not accelerator_ids:
+        accelerator_ids = ray.get_runtime_context().get_accelerator_ids().get("GPU")
+        if not accelerator_ids:
+            return None
+        return int(accelerator_ids[0])
+    except Exception:
+        logger.warning("[verl_hardware_plugin] Could not read Ray's accelerator assignment", exc_info=True)
         return None
-    return int(accelerator_ids[0])
 
 
 def _worker_init_running() -> bool:
@@ -172,6 +185,12 @@ def _pin_in_flight_configure_call(frame: FrameType) -> None:
         )
         return
     if not _xpu_hardware_present():
+        logger.warning(
+            "[verl_hardware_plugin] apply() triggered from inside an in-flight "
+            "Worker._configure_with_store call, with VERL_PLATFORM=intel set, but torch.xpu is not "
+            "available on this host. Leaving this worker unpinned; later workers in this process "
+            "use the class-level patch installed below."
+        )
         return
     store = frame.f_locals.get("store")
     if store is None:
@@ -192,61 +211,67 @@ def _pin_in_flight_configure_call(frame: FrameType) -> None:
 
 def apply() -> None:
     global _applied
-    if _applied:
-        return
 
-    from verl.single_controller.base.worker import Worker
+    # Guards the check-then-act below: two threads racing into apply() before
+    # either sets _applied could otherwise both read the same "original" and
+    # both install a wrapper, double-wrapping Worker._configure_with_store /
+    # _setup_env_cuda_visible_devices and corrupting _originals for _reset().
+    with _apply_lock:
+        if _applied:
+            return
 
-    configure_frame = _configure_with_store_frame()
-    if configure_frame is not None:
-        _pin_in_flight_configure_call(configure_frame)
+        from verl.single_controller.base.worker import Worker
 
-    late = _worker_init_running()
+        configure_frame = _configure_with_store_frame()
+        if configure_frame is not None:
+            _pin_in_flight_configure_call(configure_frame)
 
-    if not late:
-        original_setup = Worker._setup_env_cuda_visible_devices
+        late = _worker_init_running()
 
-        def _patched_setup(self):
-            original_setup(self)
-            if not _xpu_selected():
-                return
-            index = _ray_physical_index()
-            if index is None:
-                return
-            os.environ["LOCAL_RANK"] = str(index)
-            _device_module().set_device(index)
-            logger.info("[verl_hardware_plugin] Pinned xpu:%d from Ray's accelerator assignment", index)
+        if not late:
+            original_setup = Worker._setup_env_cuda_visible_devices
 
-        Worker._setup_env_cuda_visible_devices = _patched_setup
-        _originals["_setup_env_cuda_visible_devices"] = original_setup
-    else:
-        # Preferred target already ran for this instance. Fix up at the
-        # next core entry point in the same __init__: _configure_with_store
-        # re-exports store["_local_rank"] to the LOCAL_RANK env var.
-        original_configure = Worker._configure_with_store
-
-        def _patched_configure(self, store: dict):
-            if _xpu_selected():
+            def _patched_setup(self):
+                original_setup(self)
+                if not _xpu_selected():
+                    return
                 index = _ray_physical_index()
-                if index is not None:
-                    store["_local_rank"] = index
-                    _device_module().set_device(index)
-                    logger.info(
-                        "[verl_hardware_plugin] Late-pinned xpu:%d from Ray's accelerator assignment "
-                        "(patch was installed after _setup_env_cuda_visible_devices had run)",
-                        index,
-                    )
-            return original_configure(self, store=store)
+                if index is None:
+                    return
+                os.environ["LOCAL_RANK"] = str(index)
+                _device_module().set_device(index)
+                logger.info("[verl_hardware_plugin] Pinned xpu:%d from Ray's accelerator assignment", index)
 
-        Worker._configure_with_store = _patched_configure
-        _originals["_configure_with_store"] = original_configure
-        logger.warning(
-            "[verl_hardware_plugin] Ray device pinning patched at _configure_with_store: this plugin was "
-            "loaded after Worker.__init__ had already started, so the preferred patch target had already "
-            "run. Device pinning now depends on core's private store keys."
-        )
+            Worker._setup_env_cuda_visible_devices = _patched_setup
+            _originals["_setup_env_cuda_visible_devices"] = original_setup
+        else:
+            # Preferred target already ran for this instance. Fix up at the
+            # next core entry point in the same __init__: _configure_with_store
+            # re-exports store["_local_rank"] to the LOCAL_RANK env var.
+            original_configure = Worker._configure_with_store
 
-    _applied = True
+            def _patched_configure(self, store: dict):
+                if _xpu_selected():
+                    index = _ray_physical_index()
+                    if index is not None:
+                        store["_local_rank"] = index
+                        _device_module().set_device(index)
+                        logger.info(
+                            "[verl_hardware_plugin] Late-pinned xpu:%d from Ray's accelerator assignment "
+                            "(patch was installed after _setup_env_cuda_visible_devices had run)",
+                            index,
+                        )
+                return original_configure(self, store=store)
+
+            Worker._configure_with_store = _patched_configure
+            _originals["_configure_with_store"] = original_configure
+            logger.warning(
+                "[verl_hardware_plugin] Ray device pinning patched at _configure_with_store: this plugin was "
+                "loaded after Worker.__init__ had already started, so the preferred patch target had already "
+                "run. Device pinning now depends on core's private store keys."
+            )
+
+        _applied = True
 
 
 def _reset() -> None:

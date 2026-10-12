@@ -777,10 +777,21 @@ class TestReduceAvgPatchWiring:
     def test_platform_xpu_init_applies_patches(self):
         from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU
 
-        with mock.patch("verl_hardware_plugin.accelerators.xpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply:
+        # Both patches PlatformXPU.__init__ installs must be mocked here, not
+        # just reduce_avg's. ray_device_pin_patch.apply() is a real, permanent
+        # class-level monkeypatch of core's Worker with no cleanup outside
+        # tests -- unmocked, this call would leak a patched
+        # Worker._setup_env_cuda_visible_devices into every test that runs
+        # later in the same process, independent of which platform that
+        # process actually selected.
+        with (
+            mock.patch("verl_hardware_plugin.accelerators.xpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply,
+            mock.patch("verl_hardware_plugin.accelerators.xpu.patches.ray_device_pin_patch.apply") as fake_pin_apply,
+        ):
             PlatformXPU()
 
         fake_apply.assert_called_once()
+        fake_pin_apply.assert_called_once()
 
     def test_plugin_init_does_not_bind_reduce_avg_patch(self):
         import verl_hardware_plugin
