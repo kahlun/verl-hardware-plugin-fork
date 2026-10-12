@@ -40,7 +40,11 @@ Patch target is selected automatically at install time:
   ``get_resource_name()``: both resolve the platform singleton that is still
   under construction on the stack above it, so either recurses into that
   construction again. It checks ``torch.xpu`` directly and reads Ray's
-  accelerator ids under the literal ``"GPU"`` key instead.
+  accelerator ids under the literal ``"GPU"`` key instead -- and, because
+  hardware presence does not prove XPU will be *selected*, it only acts when
+  ``VERL_PLATFORM=intel`` is set explicitly (the one case core resolves
+  without probing); otherwise it leaves the worker unpinned rather than
+  guess on a mixed-hardware host.
 
 Both core targets are private API. ``_reset()`` is for tests only.
 """
@@ -87,6 +91,10 @@ def _xpu_hardware_present() -> bool:
     ``verl``'s platform singleton exists. ``_xpu_selected()`` calls
     ``get_platform()``, which would re-enter that same still-unfinished
     construction and recurse until ``RecursionError``.
+
+    Hardware being present is necessary but not sufficient: it does not mean
+    XPU is the platform about to be selected. See
+    ``_xpu_confirmed_selected_without_detection``.
     """
     try:
         import torch
@@ -94,6 +102,32 @@ def _xpu_hardware_present() -> bool:
         return hasattr(torch, "xpu") and torch.xpu.is_available()
     except Exception:  # pragma: no cover - torch not importable
         return False
+
+
+def _xpu_confirmed_selected_without_detection() -> bool:
+    """Whether this process is *certain* to select XPU, without detection.
+
+    True only when ``VERL_PLATFORM`` is explicitly set to ``"intel"``. In
+    core's ``_detect_platform_name()`` that is a plain ``os.environ`` read
+    that returns immediately, before any platform is probed or
+    constructed -- safe to duplicate here because it cannot recurse.
+
+    Returning False does *not* mean XPU will lose: with ``VERL_PLATFORM``
+    unset, core's auto-detection probes every registered platform in turn,
+    constructing a throwaway ``PlatformXPU()`` as one candidate among
+    several. ``apply()`` fires on that construction exactly as it does for
+    the real one, and at that point in the probe loop there is no way to
+    tell -- without recursing into the detection still running on the stack
+    above us -- whether this candidate will go on to win or lose. Mixed-
+    hardware hosts (XPU present but a different platform ultimately wins)
+    make guessing here unsafe: it would pin a worker to XPU, including a
+    ``torch.xpu.set_device()`` call, for a run that is not using XPU. So the
+    in-flight fallback only acts in the one case this function can answer
+    with certainty, and leaves the worker unpinned otherwise -- the same
+    outcome as "late, with no fallback installed" (silently uncorrected;
+    the run fails later, out of memory, rather than here).
+    """
+    return os.environ.get("VERL_PLATFORM", "").strip().lower() == "intel"
 
 
 def _ray_physical_index():
@@ -177,6 +211,15 @@ def _pin_in_flight_configure_call(frame: FrameType) -> None:
     ``store["_local_rank"]``, since ``env_keys()`` -- the only thing that can
     have triggered this -- runs before that comprehension's body does.
     """
+    if not _xpu_confirmed_selected_without_detection():
+        logger.warning(
+            "[verl_hardware_plugin] apply() triggered from inside an in-flight "
+            "Worker._configure_with_store call, with no VERL_PLATFORM override: cannot confirm "
+            "XPU will be selected without recursing into the auto-detection still running on the "
+            "stack above this call. Leaving this worker unpinned; later workers in this process "
+            "use the class-level patch installed below."
+        )
+        return
     if not _xpu_hardware_present():
         return
     store = frame.f_locals.get("store")

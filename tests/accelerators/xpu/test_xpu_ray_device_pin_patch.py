@@ -176,7 +176,14 @@ def test_patch_triggered_from_inside_configure_with_store_still_pins_this_worker
     ``apply()``, can be built from *inside* an in-flight ``_configure_with_store``
     call. At that point even the fallback target has already been looked up
     for this call; reinstalling it on the class cannot change what this call
-    is already running. This worker must be pinned directly from the frame."""
+    is already running. This worker must be pinned directly from the frame.
+
+    ``VERL_PLATFORM=intel`` is set explicitly here: that is the one case the
+    in-flight fallback can confirm XPU will be selected without recursing
+    into detection (see ``test_in_flight_fallback_leaves_unconfirmed_worker_unpinned``
+    for the auto-detect case, where it must not guess).
+    """
+    monkeypatch.setenv("VERL_PLATFORM", "intel")
     original_env_keys = Worker.env_keys.__func__
 
     def _env_keys_that_builds_the_platform(cls):
@@ -190,6 +197,32 @@ def test_patch_triggered_from_inside_configure_with_store_still_pins_this_worker
 
     assert recorder.pinned == [1]
     assert worker._local_rank == 1
+
+
+def test_in_flight_fallback_leaves_unconfirmed_worker_unpinned(ray_actor, recorder, monkeypatch, caplog):
+    """Mixed-hardware host, no ``VERL_PLATFORM`` override: XPU hardware being
+    present does not mean XPU will be the platform auto-detection selects --
+    this exact construction could be a losing probe candidate, and there is
+    no way to know yet without recursing into the detection still running on
+    the stack above this call (see ``_xpu_confirmed_selected_without_detection``).
+    The in-flight fallback must leave this worker unpinned rather than guess,
+    the same outcome as the undocumented "late, no fallback" case.
+    """
+    monkeypatch.delenv("VERL_PLATFORM", raising=False)
+    original_env_keys = Worker.env_keys.__func__
+
+    def _env_keys_that_builds_the_platform(cls):
+        patch.apply()
+        return original_env_keys(cls)
+
+    monkeypatch.setattr(Worker, "env_keys", classmethod(_env_keys_that_builds_the_platform))
+
+    with caplog.at_level("WARNING"):
+        worker = Worker()
+
+    assert recorder.pinned == []
+    assert worker._local_rank == 0
+    assert any("cannot confirm" in rec.message for rec in caplog.records)
 
 
 def test_in_flight_fallback_never_resolves_get_platform(ray_actor, recorder, monkeypatch):
@@ -209,6 +242,7 @@ def test_in_flight_fallback_never_resolves_get_platform(ray_actor, recorder, mon
 
     monkeypatch.setattr(patch, "_xpu_selected", _must_not_be_called)
     monkeypatch.setattr("verl.utils.device.get_resource_name", _must_not_be_called)
+    monkeypatch.setenv("VERL_PLATFORM", "intel")
 
     original_env_keys = Worker.env_keys.__func__
 
