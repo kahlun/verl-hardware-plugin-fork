@@ -1,64 +1,36 @@
 # Copyright (c) 2026 BAAI. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Monkeypatch verl's Ray worker device pinning so each XPU rank lands on its
-own physical device, with no verl-core change.
+"""Pin each Ray-launched XPU worker to the physical device Ray assigned it.
 
-Why this is needed: ``Worker._setup_env_cuda_visible_devices()`` only calls
-``set_device()`` when a ``RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES`` variable is
-set. In the default configuration verl never pins at all and relies on Ray's
-per-actor visibility mask relabeling devices so that index 0 is this rank's
-device. torch-xpu discards ``ZE_AFFINITY_MASK`` once its lazy init runs, so
-every actor still enumerates all devices and ``xpu:N`` is physical device N
-regardless of the mask -- which puts every rank of the job on ``xpu:0``. The
-collision raises no device error: it surfaces as out-of-memory, or as
-collectives taking paths meant for ranks that share a device.
+``Worker._setup_env_cuda_visible_devices()`` only calls ``set_device()`` when
+a ``RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES`` env var is set. By default verl
+relies on Ray's per-actor visibility mask to make index 0 the correct device.
+torch-xpu discards ``ZE_AFFINITY_MASK`` after lazy init, so every actor
+enumerates all physical devices and ``xpu:N`` resolves to physical device N
+regardless of the mask, putting every rank on ``xpu:0``. The collision does
+not raise; it surfaces as OOM or as collectives taking a shared-device path.
 
-This patch exists to answer one question that came up on
-verl-project/verl#8145 -- *can a plugin fix this without touching core?* -- and
-the answer it demonstrates is "yes, but only by depending on things a plugin is
-not entitled to depend on". It is a demonstration, not a recommendation; see
-``docs/design/XPU_RAY_DEVICE_PIN_PLUGIN_ONLY.md`` for the full comparison
-against the core hook.
+This module patches ``Worker`` from the plugin side, with no verl-core
+change. See ``docs/design/XPU_RAY_DEVICE_PIN_PLUGIN_ONLY.md`` for the
+core-side alternative (``PlatformBase.ray_device_index()``,
+verl-project/verl#8145).
 
-What makes this one materially hackier than this package's other patches:
+Patch target is selected automatically at install time:
 
-- **It must win a race that core owns.** The function to patch is the *first
-  statement* of ``Worker.__init__``, so the patch has to be installed before
-  any worker is constructed. That happens today only because the platform
-  singleton -- and so ``PlatformXPU.__init__``, and so this ``apply()`` -- is
-  already built during ``import verl``: this plugin's own
-  ``register_all_engines()`` imports ``verl.workers.engine.base``, which pulls
-  in ``verl/workers/engine/fsdp/transformer_impl.py``, whose module body
-  evaluates ``device_name = get_device_name()``. None of that is a contract.
-  Make that module-level call lazy in core, or register this plugin's engines
-  lazily, and ``PlatformXPU()`` is first constructed by the
-  ``get_resource_name()`` call *inside* the very method this patches. The patch
-  then lands after the method has already run -- and the failure mode of
-  arriving late is not an exception, it is two ranks quietly sharing a device.
-  ``apply()`` detects that case (by inspecting the call stack, which is itself
-  the kind of thing a plugin should not have to do) and falls back to a second
-  patch target, ``Worker._configure_with_store``, which runs later in the same
-  ``__init__``.
-- **Two private core methods, not one.** Neither ``_setup_env_cuda_visible_
-  devices`` nor ``_configure_with_store`` is public API; the fallback path also
-  has to know that ``__init__`` reads ``LOCAL_RANK`` from the environment into
-  ``store["_local_rank"]`` between the two, so the fixup has to rewrite the
-  store dict's private key as well as the environment.
-- **It cannot be narrowed to "this run is XPU".** ``_detect_platform_name()``
-  instantiates each registered platform in turn to probe it, so
-  ``PlatformXPU.__init__`` can also run on a host that merely *has* XPU
-  present while a different platform is selected -- and unlike the AVG patch,
-  what gets changed here is core's device-pinning decision for whatever
-  platform did win. ``apply()`` therefore re-checks the selected platform at
-  *call* time rather than at patch time, which means the patch stays installed
-  on ``Worker`` for the life of the process and decides per call whether to act.
+- ``Worker._setup_env_cuda_visible_devices`` (preferred). Wraps the method:
+  calls through to core's implementation, then pins the physical device via
+  ``ray.get_runtime_context().get_accelerator_ids()``. Installed from
+  ``PlatformXPU.__init__``, which runs before any ``Worker`` is constructed
+  because this plugin's ``register_all_engines()`` imports a core engine
+  module whose module body builds the platform singleton as a side effect.
 
-The clean version of all of this is one 12-line ``PlatformBase.ray_device_
-index()`` hook in core (verl-project/verl#8145) plus a 4-line override in
-``PlatformXPU``: core keeps the policy "resolve the index from Ray's own
-assignment", the plugin keeps the hardware knowledge "our runtime ignores its
-own mask", and nothing depends on import order.
+- ``Worker._configure_with_store`` (fallback). Used when ``apply()`` is
+  itself invoked from inside ``Worker.__init__`` (detected via a call-stack
+  check), meaning the preferred target already ran for this instance.
+  Writes ``store["_local_rank"]`` directly instead.
+
+Both targets are private core API. ``_reset()`` is for tests only.
 """
 
 import logging
@@ -72,20 +44,14 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _applied = False
 
-# The core methods this patch replaces, kept so ``_reset()`` can put them back.
-# Needed because ``apply()`` runs from ``PlatformXPU.__init__``, which platform
-# *detection* also calls on hosts where XPU is not the selected platform, so
-# "installed" and "active" are not the same thing here.
+# Saved so _reset() can restore them. apply() can run from a platform
+# detection probe on a host where XPU is not the selected platform, so
+# "installed" and "active" are tracked separately via _xpu_selected().
 _originals = {}
 
 
 def _xpu_selected() -> bool:
-    """True when XPU is the platform verl actually selected for this process.
-
-    Checked at call time, not at patch time: ``apply()`` can run from a
-    detection probe that constructs ``PlatformXPU()`` on a host where another
-    platform ends up winning.
-    """
+    """Whether XPU is the platform verl selected for this process."""
     from verl.plugin.platform import get_platform
 
     try:
@@ -101,11 +67,10 @@ def _device_module():
 
 
 def _ray_physical_index():
-    """Return the physical device index Ray assigned to this actor, or None.
+    """Physical device index Ray assigned to this actor, or None.
 
-    None means "nothing to pin": no Ray (in-process ``Worker`` construction
-    under torchrun, e.g. ``SFTTrainer._build_engine()``), or a CPU-only actor
-    that holds no accelerator of this resource type.
+    None covers in-process ``Worker`` construction with no Ray (e.g.
+    ``SFTTrainer._build_engine()`` under torchrun) and CPU-only actors.
     """
     import ray
 
@@ -121,13 +86,7 @@ def _ray_physical_index():
 
 
 def _worker_init_running() -> bool:
-    """True when a ``Worker.__init__`` frame is already on the stack.
-
-    If it is, this ``apply()`` was triggered from inside the method it wants to
-    patch -- via ``get_resource_name()`` -> ``get_platform()`` ->
-    ``PlatformXPU()`` -> here -- and patching that method now is a no-op for
-    the worker currently being built.
-    """
+    """Whether a ``Worker.__init__`` frame is already on the call stack."""
     from verl.single_controller.base.worker import Worker
 
     target = Worker.__init__.__code__
@@ -152,9 +111,6 @@ def apply() -> None:
         original_setup = Worker._setup_env_cuda_visible_devices
 
         def _patched_setup(self):
-            # Let core do its ROCR/HIP/CUDA normalization and, in NOSET mode,
-            # its own pin -- which resolves to the same physical id this patch
-            # would choose, so applying both is harmless.
             original_setup(self)
             if not _xpu_selected():
                 return
@@ -168,10 +124,9 @@ def apply() -> None:
         Worker._setup_env_cuda_visible_devices = _patched_setup
         _originals["_setup_env_cuda_visible_devices"] = original_setup
     else:
-        # Arrived too late for the method above. Fix up at the next core entry
-        # point inside the same ``Worker.__init__``: ``_configure_with_store``,
-        # which re-exports ``store["_local_rank"]`` to ``LOCAL_RANK``. Both the
-        # store key and the method are private to core.
+        # Preferred target already ran for this instance. Fix up at the
+        # next core entry point in the same __init__: _configure_with_store
+        # re-exports store["_local_rank"] to the LOCAL_RANK env var.
         original_configure = Worker._configure_with_store
 
         def _patched_configure(self, store: dict):
@@ -199,12 +154,7 @@ def apply() -> None:
 
 
 def _reset() -> None:
-    """Restore the core methods and forget that the patch was applied.
-
-    Only tests need this -- a real run never un-patches. It exists because a
-    plugin that patches a core class cannot otherwise undo the patch it
-    installed from a detection probe.
-    """
+    """Restore the patched methods. Test-only; a real run never un-patches."""
     global _applied
 
     from verl.single_controller.base.worker import Worker

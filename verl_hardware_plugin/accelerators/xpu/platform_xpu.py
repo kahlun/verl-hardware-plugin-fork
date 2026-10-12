@@ -100,7 +100,7 @@ class PlatformXPU(PlatformBase):
         # instead of here -- a detection probe can construct PlatformXPU() on a
         # host where another platform wins. Read that module's docstring before
         # relying on it; the hook in verl-project/verl#8145 replaces all of it.
-        from verl_hardware_plugin.patches.xpu import ray_device_pin_patch
+        from verl_hardware_plugin.accelerators.xpu.patches import ray_device_pin_patch
 
         ray_device_pin_patch.apply()
 

@@ -14,7 +14,7 @@ import os
 import pytest
 
 from verl.single_controller.base.worker import Worker
-from verl_hardware_plugin.patches.xpu import ray_device_pin_patch as patch
+from verl_hardware_plugin.accelerators.xpu.patches import ray_device_pin_patch as patch
 
 
 class _DeviceRecorder:
@@ -197,7 +197,7 @@ def test_import_verl_already_installs_the_patch_on_any_host(tmp_path):
 
     selected_platform, patched_from = out[-2], out[-1]
     assert selected_platform != "xpu"
-    assert patched_from == "verl_hardware_plugin.patches.xpu.ray_device_pin_patch"
+    assert patched_from == "verl_hardware_plugin.accelerators.xpu.patches.ray_device_pin_patch"
 
 
 def test_apply_is_idempotent(ray_actor, recorder):
