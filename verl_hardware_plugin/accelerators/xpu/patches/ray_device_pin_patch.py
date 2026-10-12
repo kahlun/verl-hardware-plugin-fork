@@ -36,10 +36,11 @@ Patch target is selected automatically at install time:
   worker. Installing the fallback on the class does not change a call
   already in progress, so this worker is instead fixed up directly from its
   call frame before the class-level fallback above is installed for later
-  workers. This path cannot call ``_xpu_selected()``: the platform singleton
-  it would resolve is the very one still under construction on the stack
-  above it, so asking ``get_platform()`` recurses into that construction
-  again. It checks ``torch.xpu`` directly instead.
+  workers. This path cannot call ``_xpu_selected()`` or
+  ``get_resource_name()``: both resolve the platform singleton that is still
+  under construction on the stack above it, so either recurses into that
+  construction again. It checks ``torch.xpu`` directly and reads Ray's
+  accelerator ids under the literal ``"GPU"`` key instead.
 
 Both core targets are private API. ``_reset()`` is for tests only.
 """
@@ -114,6 +115,28 @@ def _ray_physical_index():
     return int(accelerator_ids[0])
 
 
+def _ray_physical_index_no_platform_lookup():
+    """Same as ``_ray_physical_index()``, without ``get_resource_name()``.
+
+    ``get_resource_name()`` is ``get_platform().ray_resource_name()`` --
+    another path into the same still-under-construction singleton as
+    ``_xpu_selected()`` (see ``_xpu_hardware_present``). Used only by the
+    in-flight fallback, where that call would recurse. Reads Ray's
+    accelerator ids under the literal ``"GPU"`` key instead, which is not a
+    guess: ``PlatformXPU.ray_resource_name()`` always returns ``"GPU"`` (it
+    reuses Ray's built-in GPU resource rather than a custom one).
+    """
+    import ray
+
+    if not ray.is_initialized():
+        return None
+
+    accelerator_ids = ray.get_runtime_context().get_accelerator_ids().get("GPU")
+    if not accelerator_ids:
+        return None
+    return int(accelerator_ids[0])
+
+
 def _worker_init_running() -> bool:
     """Whether a ``Worker.__init__`` frame is already on the call stack."""
     from verl.single_controller.base.worker import Worker
@@ -159,7 +182,7 @@ def _pin_in_flight_configure_call(frame: FrameType) -> None:
     store = frame.f_locals.get("store")
     if store is None:
         return
-    index = _ray_physical_index()
+    index = _ray_physical_index_no_platform_lookup()
     if index is None:
         return
     store["_local_rank"] = index

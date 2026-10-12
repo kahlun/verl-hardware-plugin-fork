@@ -194,19 +194,21 @@ def test_patch_triggered_from_inside_configure_with_store_still_pins_this_worker
 
 def test_in_flight_fallback_never_resolves_get_platform(ray_actor, recorder, monkeypatch):
     """Regression test: ``get_platform()`` must never be called from the
-    in-flight fallback. At that point ``PlatformXPU`` is still under
-    construction, so the platform singleton it would resolve is the one
-    currently being built on the stack above it -- calling ``get_platform()``
-    (what ``_xpu_selected()`` does) recurses into that same construction and
-    grows the stack without bound until ``RecursionError``, which verl's own
+    in-flight fallback, neither directly (``_xpu_selected()``) nor via
+    ``get_resource_name() -> get_platform().ray_resource_name()``. At that
+    point ``PlatformXPU`` is still under construction, so the platform
+    singleton either call would resolve is the one currently being built on
+    the stack above it -- recursing into that same construction and growing
+    the stack without bound until ``RecursionError``, which verl's own
     detection loop can swallow via a bare ``except Exception``, silently
     selecting the wrong platform instead of pinning this worker.
     """
 
-    def _must_not_be_called():
-        raise AssertionError("in-flight fallback must not call _xpu_selected()/get_platform()")
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("in-flight fallback must not resolve get_platform()")
 
     monkeypatch.setattr(patch, "_xpu_selected", _must_not_be_called)
+    monkeypatch.setattr("verl.utils.device.get_resource_name", _must_not_be_called)
 
     original_env_keys = Worker.env_keys.__func__
 
