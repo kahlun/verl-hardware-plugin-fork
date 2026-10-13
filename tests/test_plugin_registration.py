@@ -760,19 +760,6 @@ class TestMayEnableFlagGems:
                         may_enable_flag_gems(phase="training")
 
 
-class TestXPURayDeviceIndex:
-    """PlatformXPU pins Ray's physical device id, ignoring ZE_AFFINITY_MASK."""
-
-    def test_returns_physical_id_even_when_masked(self):
-        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
-
-        platform = PlatformXPU.__new__(PlatformXPU)
-        with mock.patch.dict(os.environ, {"ZE_AFFINITY_MASK": "2"}):
-            assert platform.ray_device_index(["2"]) == 2
-        with mock.patch.dict(os.environ, {}, clear=True):
-            assert platform.ray_device_index(["3"]) == 3
-
-
 class TestReduceAvgPatchWiring:
     """The reduce_avg monkeypatch must fire on platform *selection*, not on
     mere XPU hardware/SDK *presence*.
@@ -790,10 +777,16 @@ class TestReduceAvgPatchWiring:
     def test_platform_xpu_init_applies_patches(self):
         from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU
 
-        with mock.patch("verl_hardware_plugin.accelerators.xpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply:
+        with (
+            mock.patch("verl_hardware_plugin.accelerators.xpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply,
+            mock.patch(
+                "verl_hardware_plugin.accelerators.xpu.patches.vl_attn_hub_kernels_patch.apply"
+            ) as fake_vl_attn_apply,
+        ):
             PlatformXPU()
 
         fake_apply.assert_called_once()
+        fake_vl_attn_apply.assert_called_once()
 
     def test_plugin_init_does_not_bind_reduce_avg_patch(self):
         import verl_hardware_plugin

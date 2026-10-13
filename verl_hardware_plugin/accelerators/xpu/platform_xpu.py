@@ -33,9 +33,14 @@ import torch
 
 from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
+from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch, vl_attn_hub_kernels_patch
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+# Every monkeypatch this platform installs, applied from __init__ below. See
+# each module's own docstring for what it patches and why.
+_PATCHES = (reduce_avg_allreduce_patch, vl_attn_hub_kernels_patch)
 
 
 def _ensure_torch_xpu() -> bool:
@@ -78,20 +83,19 @@ class PlatformXPU(PlatformBase):
     """
 
     def __init__(self) -> None:
-        # Apply this platform's monkeypatch only now, when XPU is actually
-        # the platform verl selected for this process (verl.plugin.platform.
-        # platform_manager._create_platform() only constructs PlatformXPU()
-        # when platform detection -- explicit VERL_PLATFORM=intel or
-        # auto-detection -- picked "intel"). Applying it from the shared
-        # verl_hardware_plugin/__init__.py instead would fire on any host
-        # where XPU hardware/SDK merely happens to be present, even if a
-        # different platform ends up selected for this run -- e.g. a mixed
-        # host with VERL_PLATFORM=nvidia explicitly set would still get its
-        # process-wide torch.distributed.all_reduce(op=AVG) semantics
-        # changed for no reason.
-        from verl_hardware_plugin.accelerators.xpu.patches import reduce_avg_allreduce_patch
+        """Apply this platform's monkeypatches (see ``_PATCHES`` above).
 
-        reduce_avg_allreduce_patch.apply()
+        Applied here rather than from the shared ``verl_hardware_plugin/__init__.py``
+        so a patch only installs on hosts where XPU is actually in play, not on
+        every host regardless of which platform verl selects -- that shared
+        init runs once for every vendor. ``PlatformXPU()`` is also constructed
+        as a losing detection probe on hosts where a different platform wins,
+        so this constructor running does not mean XPU was selected: each
+        patch's own ``apply()`` must gate its correctness at call time, not
+        here. See each patch module's own docstring for how it does that.
+        """
+        for patch_module in _PATCHES:
+            patch_module.apply()
 
     # ------------------------------------------------------------------
     # Core device management
@@ -201,14 +205,6 @@ class PlatformXPU(PlatformBase):
         # Tell Ray NOT to auto-set ZE_AFFINITY_MASK — verl manages device
         # assignment manually to support multi-GPU-per-actor configurations
         return ["RAY_EXPERIMENTAL_NOSET_ZE_AFFINITY_MASK"]
-
-    def ray_device_index(self, accelerator_ids: list[str]) -> int:
-        # torch-xpu discards ZE_AFFINITY_MASK once its lazy init runs, so every
-        # actor still enumerates all devices and xpu:N is physical device N
-        # regardless of the mask. Pin the physical id Ray assigned; the base
-        # implementation's mask-relative index would put every rank on xpu:0.
-        # Only called by verl-core that has PlatformBase.ray_device_index().
-        return int(accelerator_ids[0])
 
     # ------------------------------------------------------------------
     # IPC support
