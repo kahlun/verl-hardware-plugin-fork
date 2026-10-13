@@ -286,12 +286,29 @@ def test_import_verl_already_installs_the_patch_on_any_host(tmp_path):
     """Both halves of what makes this a demonstration, in one subprocess.
 
     1. ``import verl`` alone -- no worker, no Ray -- already replaces core's
-       ``Worker._setup_env_cuda_visible_devices`` with this module's function,
-       on a host with no XPU at all, because platform detection constructs
-       ``PlatformXPU()`` to probe it.
+       ``Worker._setup_env_cuda_visible_devices`` with this module's function
+       once XPU is selected, because platform detection constructs
+       ``PlatformXPU()`` to probe or select it.
     2. That is also the only reason the patch is ever in time: it has to be
        installed before the first ``Worker`` is built, and nothing in core
        promises that the platform singleton exists by then.
+
+    ``VERL_PLATFORM=intel`` is set rather than left to auto-detection.
+    ``_detect_platform_name()`` walks the other registered platforms first
+    and returns the first one whose ``is_platform_available()`` reports
+    ``True``; on a host with a real NVIDIA/NPU/AMD device recognized earlier
+    in that order, detection would return there and ``PlatformXPU`` would
+    never be constructed in this run at all -- not a bug in the patch, just
+    an outcome this test doesn't control for free. (An attempt to force that
+    by monkeypatching every other platform's ``is_platform_available`` after
+    ``import verl`` does not work either: ``import verl`` itself already
+    resolves and caches the platform singleton as a side effect -- this
+    plugin's own ``register_all_engines()`` pulls in a core engine module
+    that calls ``get_device_name()`` -- before any of our own code in this
+    script gets to run. There is no point after ``import verl`` returns
+    where the decision is still open to influence.) Forcing the env var
+    is the only input checked *before* any of that resolution happens, so
+    it is the one lever this test can actually pull deterministically.
     """
     import subprocess
     import sys
@@ -302,9 +319,11 @@ def test_import_verl_already_installs_the_patch_on_any_host(tmp_path):
         "from verl.plugin.platform import get_platform\n"
         "print(get_platform().device_name, Worker._setup_env_cuda_visible_devices.__module__)\n"
     )
-    # Entry-point discovery and auto-detection both on, whatever the parent
-    # suite's fixtures set for themselves.
-    env = {k: v for k, v in os.environ.items() if k not in ("VERL_USE_EXTERNAL_PLUGINS", "VERL_PLATFORM")}
+    # Entry-point discovery stays whatever the parent suite's fixtures set
+    # for themselves; VERL_PLATFORM is forced so platform selection does not
+    # depend on what hardware this test happens to run on.
+    env = {k: v for k, v in os.environ.items() if k != "VERL_USE_EXTERNAL_PLUGINS"}
+    env["VERL_PLATFORM"] = "intel"
 
     out = subprocess.run(
         [sys.executable, "-c", script],
@@ -314,7 +333,8 @@ def test_import_verl_already_installs_the_patch_on_any_host(tmp_path):
         env=env,
     ).stdout.split()
 
-    patched_from = out[-1]
+    device_name, patched_from = out
+    assert device_name == "xpu"
     assert patched_from == "verl_hardware_plugin.accelerators.xpu.patches.ray_device_pin_patch"
 
 
