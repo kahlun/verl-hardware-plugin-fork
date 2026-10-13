@@ -68,3 +68,16 @@ pytest tests/accelerators/tpu/test_tpu_engine.py -v
 ```
 
 Expected: all TPU registration and engine utility cases pass on any host, with or without a TPU attached.
+
+## 5. Run SFT with TorchTitan on TPU
+
+Launch the Multi-Controller SFT trainer (`verl.trainer.sft_trainer`) via `torchrun` with `engine=torchtitan` and `engine.pad_to_length=True`:
+
+```bash
+torchrun --nnodes=1 --nproc_per_node=4 -m verl.trainer.sft_trainer \
+    engine=torchtitan \
+    engine.pad_to_length=True \
+    engine.pad_to_length_bucket=256 \
+    trainer.device=tpu
+```
+
