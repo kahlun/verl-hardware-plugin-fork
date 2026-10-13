@@ -347,21 +347,37 @@ def _find_def(tree, name, cls=None):
 
 
 def test_applied_from_platform_xpu_init():
-    """Platform-gated: only PlatformXPU construction (verl selected XPU) installs the patch."""
-    tree = ast.parse((PATCH_PATH.parents[1] / "platform_xpu.py").read_text())
-    init = _find_def(tree, "__init__", cls="PlatformXPU")
+    """Platform-gated: only PlatformXPU construction (verl selected XPU) installs the patch.
 
-    assert init is not None, "PlatformXPU must define __init__ that applies the patch"
-    calls = [
-        n
-        for n in ast.walk(init)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "apply"
-        and isinstance(n.func.value, ast.Name)
-        and n.func.value.id == "numa_affinity_patch"
-    ]
-    assert calls, "PlatformXPU.__init__ must call numa_affinity_patch.apply()"
+    PlatformXPU.__init__ applies every entry of the module-level ``_PATCHES``
+    tuple in a loop (see platform_xpu.py), rather than calling each patch's
+    ``apply()`` by name inline. So the AST check here is two-part: the patch
+    module is listed in ``_PATCHES``, and ``__init__`` actually loops over
+    ``_PATCHES`` calling ``.apply()`` on each entry.
+    """
+    tree = ast.parse((PATCH_PATH.parents[1] / "platform_xpu.py").read_text())
+
+    patches_assign = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and len(n.targets) == 1
+            and isinstance(n.targets[0], ast.Name)
+            and n.targets[0].id == "_PATCHES"
+        ),
+        None,
+    )
+    assert patches_assign is not None, "platform_xpu.py must define a module-level _PATCHES tuple"
+    patch_names = {elt.id for elt in patches_assign.value.elts if isinstance(elt, ast.Name)}
+    assert "numa_affinity_patch" in patch_names, "_PATCHES must include numa_affinity_patch"
+
+    init = _find_def(tree, "__init__", cls="PlatformXPU")
+    assert init is not None, "PlatformXPU must define __init__ that applies the patches"
+    loops_over_patches = any(
+        isinstance(n, ast.For) and isinstance(n.iter, ast.Name) and n.iter.id == "_PATCHES" for n in ast.walk(init)
+    )
+    assert loops_over_patches, "PlatformXPU.__init__ must loop over _PATCHES calling .apply() on each entry"
 
 
 def test_not_referenced_from_shared_patches_init():
