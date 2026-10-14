@@ -70,6 +70,19 @@ def test_raises_clear_error_when_no_backend_is_available_anywhere(target_module,
         target_module._custom_flash_attention_forward()
 
 
+def test_fallback_imports_resolve_against_real_transformers():
+    """`_load_hub_kernels_fallback()` is mocked out in the tests above, so none
+    of them would catch an import inside it pointing at the wrong module.
+    `FLASH_ATTN_KERNEL_FALLBACK` lives in `transformers.modeling_flash_attention_utils`
+    (confirmed on transformers 5.10.4, 5.17.0 and 5.19.0 - it has never lived in
+    `transformers.integrations.hub_kernels`, in any version checked); only
+    `get_attn_kernel_version` lives in `hub_kernels`, and only from 5.17.0 on.
+    """
+    from transformers.modeling_flash_attention_utils import FLASH_ATTN_KERNEL_FALLBACK
+
+    assert "flash_attention_2" in FLASH_ATTN_KERNEL_FALLBACK
+
+
 def test_apply_is_a_noop_off_xpu(monkeypatch):
     monkeypatch.setattr(patch_mod, "_xpu_available", lambda: False)
     monkeypatch.setattr(patch_mod, "_applied", False)

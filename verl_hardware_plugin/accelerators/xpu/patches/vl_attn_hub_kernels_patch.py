@@ -67,7 +67,8 @@ def _load_hub_kernels_fallback():
     """Return (flash_attn_func, flash_attn_varlen_func) via HF Hub kernels, or None."""
     try:
         from kernels import get_kernel
-        from transformers.integrations.hub_kernels import FLASH_ATTN_KERNEL_FALLBACK, get_attn_kernel_version
+        from transformers.integrations.hub_kernels import get_attn_kernel_version
+        from transformers.modeling_flash_attention_utils import FLASH_ATTN_KERNEL_FALLBACK
 
         repo_id = FLASH_ATTN_KERNEL_FALLBACK["flash_attention_2"]
         kernel = get_kernel(repo_id, version=get_attn_kernel_version(repo_id))
