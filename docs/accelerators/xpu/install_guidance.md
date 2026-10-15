@@ -7,13 +7,14 @@ in verl-core for the plugin pattern this follows.
 
 ## Prerequisites
 
-- PyTorch with XPU support (`torch.xpu.is_available() == True`)
-- vLLM with XPU kernels — either the prebuilt wheel from vLLM's XPU wheel
-  index (`pip install "vllm==<version>+xpu" --extra-index-url
-  https://wheels.vllm.ai/<version>/xpu`) or built from source with
-  `VLLM_TARGET_DEVICE=xpu`. The default PyPI `pip install vllm` wheel does
-  not ship XPU kernels.
-- oneCCL runtime for the `xccl` distributed backend
+- An Intel GPU with the Level Zero driver stack on the host (compute-runtime >= 26.18 and Level Zero).
+  **A system oneAPI install is not required**: PyTorch's XPU wheel and vLLM's XPU wheel bring their own SYCL
+  runtime and oneCCL (the `xccl` backend). This was checked by hiding `/opt/intel/oneapi` and the oneAPI
+  environment variables: platform detection, an `xccl` all_reduce and a GRPO training step all still worked.
+- PyTorch with XPU support (`torch.xpu.is_available() == True`).
+- vLLM with XPU kernels, from vLLM's XPU wheel index (`pip install "vllm==<version>+xpu"
+  --extra-index-url https://wheels.vllm.ai/<version>/xpu`) or built from source with
+  `VLLM_TARGET_DEVICE=xpu`. The default PyPI `pip install vllm` wheel does not ship XPU kernels.
 
 **verl-core version note:** the one `PlatformBase` hook this plugin
 implements, `profiler_markers()`, was merged into `verl-project/verl:main` on
@@ -31,26 +32,40 @@ plugin-side monkeypatch over `torch.distributed.all_reduce`
 
 ## 1. Install verl and verl-hardware-plugin
 
-```bash
-# Install verl (needs the profiler_markers() hook, on main since 2026-10-08 — see note above)
-git clone https://github.com/verl-project/verl.git
-cd verl
-pip install -e .
+Pick one. Both give the same environment (checked: torch 2.13.0+xpu, vLLM 0.29.0+xpu, transformers 5.17.0).
 
-# Install verl-hardware-plugin
+### Option A: Docker (recommended)
+
+The Intel GPU image is maintained with verl-core, in
+[`docker/xpu/`](https://github.com/verl-project/verl/tree/main/docker/xpu). It installs verl and this plugin
+together, so there is nothing else to do. Build and run steps are in that directory's README.
+
+### Option B: From source
+
+verl pins its own versions, and `pip install -e .` on a verl checkout can replace the XPU build of torch with a
+different one (it also downgrades `transformers` and `tensordict` to verl's pins). Install the XPU dependency
+set the way verl-core documents it, in
+[`docker/xpu/README.md` ("Installing Without Docker")](https://github.com/verl-project/verl/blob/main/docker/xpu/README.md),
+which uses verl's `requirements-xpu.txt`. Then install this plugin on top of that environment:
+
+```bash
 git clone https://github.com/verl-project/verl-hardware-plugin.git
 cd verl-hardware-plugin
-pip install -e .
+pip install --no-deps -e .
 ```
 
-No environment variable is required beyond this. The plugin is
-auto-discovered by verl through the `verl.plugins` setuptools entry_points
+`--no-deps` keeps the plugin install from touching the torch/verl already in place. The plugin needs no
+environment variable: it is auto-discovered by verl through the `verl.plugins` setuptools entry_points
 group declared in this repo's `pyproject.toml`
-(`[project.entry-points."verl.plugins"] hardware = "verl_hardware_plugin"`),
-which verl loads by default (`VERL_USE_EXTERNAL_PLUGINS=auto`). Set
-`VERL_USE_EXTERNAL_PLUGINS=none` to disable discovery, e.g. to isolate a bug
-to this plugin, or `VERL_PLATFORM=intel` to force platform selection instead
-of relying on auto-detection.
+(`[project.entry-points."verl.plugins"] hardware = "verl_hardware_plugin"`), which verl loads by default
+(`VERL_USE_EXTERNAL_PLUGINS=auto`).
+
+### Platform selection
+
+With the plugin installed, verl picks the Intel platform by itself on a host where `torch.xpu` is available.
+`VERL_PLATFORM=intel` is only an override, for forcing the choice (for example on a host with several kinds of
+accelerator). `VERL_USE_EXTERNAL_PLUGINS=none` disables discovery, e.g. to isolate a bug to this plugin; verl then
+falls back to `nvidia`.
 
 ## 2. Verify the Install
 
@@ -63,9 +78,10 @@ print('device:', p.device_name, '/ vendor:', p.vendor_name)
 ```
 
 Expected on Intel GPU: `device: xpu / vendor: intel`. If it instead falls
-back to `nvidia`, the plugin was not discovered — check that `pip install`
-completed without error and that no `VERL_USE_EXTERNAL_PLUGINS=none` is set
-in the environment.
+back to `nvidia`, either the plugin was not discovered (check that `pip install`
+completed without error and that no `VERL_USE_EXTERNAL_PLUGINS=none` is set) or
+torch lost its XPU build (check `python3 -c "import torch; print(torch.__version__, torch.xpu.is_available())"`;
+a plain version like `2.14.1` without `+xpu` means a dependency install replaced it).
 
 ## Next Steps
 

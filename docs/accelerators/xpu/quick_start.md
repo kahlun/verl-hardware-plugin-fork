@@ -48,7 +48,7 @@ python3 examples/data_preprocess/gsm8k.py --local_save_dir ~/data/gsm8k
 ## 3. Launch Training
 
 ```bash
-export ZE_AFFINITY_MASK=0,1            # select physical device indices
+export ZE_AFFINITY_MASK=0              # select physical device indices (0,1 for the 2-GPU run below)
 unset ONEAPI_DEVICE_SELECTOR           # must NOT be set
 
 python3 -m verl.trainer.main_ppo \
@@ -72,24 +72,32 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.enforce_eager=True \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     trainer.total_epochs=1 \
+    trainer.total_training_steps=1 \
+    trainer.test_freq=-1 \
+    trainer.save_freq=-1 \
     +ray_kwargs.ray_init.num_gpus=1
 ```
 
-Expected (Qwen2.5-0.5B-Instruct, GSM8K, batch 16, 1 step, 1x Arc Pro B60):
+This is a smoke test: `total_training_steps=1` stops after one step (without it, `total_epochs=1` over GSM8K at
+batch 16 is about 467 steps). Raise it for a longer run.
+
+Expected (Qwen2.5-0.5B-Instruct, GSM8K, batch 16, 1x Arc Pro B60). The first step includes warm-up; a second
+step (`total_training_steps=2`) shows steady state:
 
 ```text
-timing_s/step: ~51   timing_per_token_ms/gen: ~0.35
-perf/throughput: ~148 tok/s
+step 1:  timing_s/step: ~18-21   perf/throughput: ~190-210 tok/s
+step 2:  timing_s/step: ~8        perf/throughput: ~430-460 tok/s
+timing_per_token_ms/gen: ~1.0    perf/max_memory_allocated_gb: ~9.2
 ```
 
-On 2 GPUs with the same batch size (throughput scales with larger batch —
-this keeps the comparison apples-to-apples rather than showing peak
-throughput):
-
-```text
-timing_s/step: ~93   perf/throughput: ~41 tok/s
-```
+(Measured 2026-10-15 with verl `5b550b0c`, this plugin at `e5ab532`, vLLM 0.29.0+xpu, torch 2.13.0+xpu.
+Timings vary with the stack and the host.) The 2-GPU figure that used to be listed here (~93 s/step at the same
+batch size) has not been re-measured on this stack.
 
 ## 4. Run the Plugin Test Suite
 
@@ -108,8 +116,8 @@ Intel GPU attached.
 | Inference engine | vLLM validated | SGLang: `update_weights` — Work in Progress |
 | Trainer backend | FSDP, FSDP2 | Megatron — Work in Progress |
 | Algorithms | GRPO, PPO, SFT | Validated on GSM8K / Qwen2.5 |
-| Hardware (1-GPU) | Validated | Arc Pro B60: 51.2 s/step, 148.2 tok/s (batch 16, Qwen2.5-0.5B) |
-| Hardware (2-GPU) | Validated | Arc Pro B60 x2: 93.0 s/step at same batch size |
+| Hardware (1-GPU) | Validated | Arc Pro B60: ~8 s/step steady state, ~450 tok/s (batch 16, Qwen2.5-0.5B, vLLM 0.29.0) |
+| Hardware (2-GPU) | Validated | Arc Pro B60 x2 (not re-measured on the current stack) |
 | Multi-node | Work in Progress | — |
 | Profiler | Intel VTune (ITT) — Validated | `profiler_markers()` hook merged into verl-core `main` on 2026-10-08; VTune collector capture itself still untested, see [profiling.md](./profiling.md) |
 
