@@ -282,7 +282,7 @@ class PlatformXPU(PlatformBase):
         # group instead. See xccl_collective_xpu.py for why
         # get_unique_id()/NcclCommunicator() carry (host, port) rather than
         # a NCCL unique-id blob.
-        from verl_hardware_plugin.collectives import xccl_collective_xpu
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
 
         return xccl_collective_xpu
 

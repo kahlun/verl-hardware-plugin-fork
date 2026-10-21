@@ -772,7 +772,7 @@ class TestXPUCollectiveModule:
         assert callable(module.NcclCommunicator)
 
     def test_get_unique_id_returns_a_free_port_not_a_byte_blob(self):
-        from verl_hardware_plugin.collectives import xccl_collective_xpu
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
 
         with mock.patch("ray.util.get_node_ip_address", return_value="127.0.0.1"):
             host, port = xccl_collective_xpu.get_unique_id()
@@ -781,7 +781,7 @@ class TestXPUCollectiveModule:
         assert isinstance(port, int) and port > 0
 
     def test_constructor_calls_init_process_group_with_hybrid_backend(self):
-        from verl_hardware_plugin.collectives import xccl_collective_xpu
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
 
         with mock.patch("torch.distributed.init_process_group") as fake_init:
             xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
@@ -794,7 +794,7 @@ class TestXPUCollectiveModule:
         )
 
     def test_rank_id_reports_constructor_rank(self):
-        from verl_hardware_plugin.collectives import xccl_collective_xpu
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
 
         with mock.patch("torch.distributed.init_process_group"):
             comm = xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
@@ -802,7 +802,7 @@ class TestXPUCollectiveModule:
         assert comm.rank_id() == 1
 
     def test_pg_property_is_the_default_world_group(self):
-        from verl_hardware_plugin.collectives import xccl_collective_xpu
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
 
         with mock.patch("torch.distributed.init_process_group"), mock.patch("torch.distributed.group") as fake_group:
             comm = xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
