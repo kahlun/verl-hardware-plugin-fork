@@ -4,8 +4,8 @@
 """vLLM / vllm-torchtpu runtime patches for multi-host TPU rollout.
 
 ``patch_vllm_for_tpu`` lets the vLLM engine of a ``TPUvLLMHttpServer`` run on all hosts of a TPU
-slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-torchtpu
-(9faafb17) and can be dropped once upstream closes it:
+slice through Ray. Each patch fills a gap in vLLM (v0.29.0 / v0.31.0) and vllm-torchtpu
+(9faafb17 / 33ee547b) and can be dropped once upstream closes it:
 
 * ``EngineArgs.create_engine_config``, ``initialize_ray_cluster`` and
   ``RayDistributedExecutor._init_workers_ray``: run the engine on vLLM's generic Ray executor,
@@ -18,8 +18,11 @@ slice through Ray. Each patch fills a gap in the pinned vLLM (v0.29.0) and vllm-
   raise the limit on every thread.
 * ``TPUWorker.reset_encoder_cache``: no-op. verl resets vLLM's caches after every weight update,
   and vllm-torchtpu's worker does not implement this call. Upstream fix: implement it.
-* ``TPUModelRunner.gather_logprobs`` and ``sample_from_logits``: normalize log probabilities
-  and draw sampling noise in FP32, avoiding BF16 cancellation and sampling bias.
+* ``TPUModelRunner.gather_logprobs``: normalize log probabilities in FP32, avoiding BF16
+  cancellation. Skipped when vllm-torchtpu already does it (#2024).
+* ``TPUModelRunner.sample_from_logits``: redraw BF16 sampling noise in FP32, avoiding sampling
+  bias. vllm-torchtpu #1747 draws the noise in FP32 at the call sites, so there the wrapper
+  passes it through unchanged.
 * ``VLLM_DISABLE_COMPILE_CACHE=1``: a reloaded compile-cache artifact can make vLLM run the model
   eagerly, which crashes libtpu (b/501165531). Upstream fix: that bug.
 * ``multiprocessing.process.BaseProcess.__init__`` and ``RayWorkerWrapper.__init__``: install
@@ -46,6 +49,14 @@ logger = logging.getLogger(__name__)
 _PATCHES_APPLIED = False
 
 
+def _source_upcasts_to_fp32(fn) -> bool:
+    """Whether ``fn``'s source already computes in FP32 (vllm-torchtpu >= #2024's ``gather_logprobs`` does)."""
+    try:
+        return "torch.float32" in inspect.getsource(inspect.unwrap(fn))
+    except (OSError, TypeError):
+        return False
+
+
 def patch_tpu_logprobs() -> None:
     """Use FP32 log_softmax when reporting vllm-torchtpu token log probabilities."""
     if importlib.util.find_spec("vllm_torchtpu") is None:
@@ -55,6 +66,11 @@ def patch_tpu_logprobs() -> None:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
     if getattr(TPUModelRunner, "_verl_fp32_logprobs_patched", False):
+        return
+    if _source_upcasts_to_fp32(getattr(TPUModelRunner, "gather_logprobs", None)):
+        # vllm-torchtpu #2024 normalizes the log probabilities in FP32 itself.
+        TPUModelRunner._verl_fp32_logprobs_patched = True
+        logger.info("vllm-torchtpu already computes log probabilities in FP32; logprob patch not needed.")
         return
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -93,11 +109,15 @@ def patch_tpu_logprobs() -> None:
 _fp32_sampling_noise_logged = False
 
 
-# TODO: Remove once vllm-torchtpu draws its sampling uniforms in FP32.
+# TODO: Remove once the minimum supported vllm-torchtpu includes #1747.
 def patch_tpu_sampler() -> None:
     """Draw TPU sampling noise from FP32 random values to reduce BF16 rounding bias.
 
-    Use the runner's sampling generator when available.
+    Older vllm-torchtpu draws the Gumbel-Max uniforms ``u`` in the logits dtype (BF16); the wrapper
+    redraws them in FP32 with the runner's sampling generator when available. vllm-torchtpu #1747
+    draws ``u`` in FP32 at the call sites rather than inside ``sample_from_logits``, so the
+    function's own source cannot tell the versions apart; the wrapper checks ``u.dtype`` at run
+    time instead and passes FP32 noise through unchanged.
     Apply this patch before the TPU model runner is created.
     """
     if importlib.util.find_spec("vllm_torchtpu") is None:
@@ -109,6 +129,8 @@ def patch_tpu_sampler() -> None:
         return
 
     original = getattr(TPUModelRunner, "sample_from_logits", None)
+    # Later vllm-torchtpu releases append parameters (e.g. ``topk_candidates``); only the leading
+    # ones are used here and the rest are forwarded unchanged.
     expected = ["self", "logits", "temperatures", "u", "top_k", "top_p", "all_greedy"]
     try:
         parameters = list(inspect.signature(original).parameters) if callable(original) else None
@@ -117,7 +139,7 @@ def patch_tpu_sampler() -> None:
         parameters = expected
     if parameters in (["args", "kwargs"], ["self", "args", "kwargs"]):
         parameters = expected
-    if parameters != expected:
+    if parameters is None or parameters[: len(expected)] != expected:
         logger.error(
             "TPU sampler FP32 patch NOT applied: TPUModelRunner.sample_from_logits has parameters %s, "
             "expected %s. Sampling noise stays BF16, which biases policy-gradient training.",
@@ -126,7 +148,7 @@ def patch_tpu_sampler() -> None:
         )
         return
 
-    def sample_from_logits(self, logits, temperatures, u, top_k, top_p, all_greedy=False):
+    def sample_from_logits(self, logits, temperatures, u, top_k, top_p, all_greedy=False, *args, **kwargs):
         # The all-greedy path never reads ``u``; preserve its compiled graph.
         if not all_greedy and u.dtype != torch.float32:
             global _fp32_sampling_noise_logged
@@ -144,7 +166,7 @@ def patch_tpu_sampler() -> None:
                 # None during precompile warm-up, where the call site also uses the global RNG.
                 generator=getattr(self, "_sampling_generator", None),
             )
-        return original(self, logits, temperatures, u, top_k, top_p, all_greedy=all_greedy)
+        return original(self, logits, temperatures, u, top_k, top_p, all_greedy, *args, **kwargs)
 
     # functools.wraps copies torch.compile's bookkeeping attributes, which can let
     # Dynamo unwrap straight to the compiled function and skip the redraw.

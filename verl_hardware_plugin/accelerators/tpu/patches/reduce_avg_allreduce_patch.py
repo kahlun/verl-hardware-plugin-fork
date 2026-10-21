@@ -16,7 +16,7 @@ Why this is needed:
 3. ``verl.utils.distributed.set_numa_affinity`` queries ``pynvml`` (NVIDIA NVML) when
    ``libnuma.so`` is present, and ``verl.utils.torch_functional.logprobs_from_logits``
    falls back to row-wise Python loops (``logprobs_from_logits_v2``) instead of vectorized
-   ``logprobs_from_logits_naive`` on TPU.
+   ``logprobs_from_logits_naive`` (run in fp32, as on GPU) on TPU.
 
 All patches are applied lazily when ``PlatformTPU()`` is constructed (i.e. only when the
 ``tpu`` platform is selected for the process).
@@ -46,9 +46,9 @@ def _tpu_available() -> bool:
             import torch_tpu  # noqa: F401
         except Exception:
             return False
-    tpu = getattr(torch, "tpu", None)
-    is_avail = getattr(tpu, "is_available", None)
-    return bool(callable(is_avail) and is_avail())
+    from verl_hardware_plugin.accelerators.tpu import device_api
+
+    return device_api.is_available()
 
 
 def _is_tpu_all_reduce(tensor: Any, group: Any) -> bool:
@@ -59,6 +59,19 @@ def _is_tpu_all_reduce(tensor: Any, group: Any) -> bool:
         device = getattr(tensor, "device", None)
         return getattr(device, "type", None) == "tpu"
     return False
+
+
+def _is_gloo_only_group_with_tpu_tensor(tensor: Any, group: Any) -> bool:
+    if group is None or torch.compiler.is_compiling():
+        return False
+    device = getattr(tensor, "device", None)
+    if getattr(device, "type", None) != "tpu":
+        return False
+    try:
+        backend = str(dist.get_backend(group))
+    except Exception:
+        return False
+    return "gloo" in backend and "tpu_dist" not in backend
 
 
 def _detach_tpu_tensors_to_cpu(obj: Any) -> Any:
@@ -102,7 +115,8 @@ def _apply_verl_runtime_helpers() -> None:
             def _patched_logprobs_from_logits(logits, labels, inplace_backward=True):
                 device = getattr(logits, "device", None)
                 if getattr(device, "type", None) == "tpu":
-                    return naive_logprobs(logits, labels)
+                    # fp32 log-softmax, as flash-attn's cross entropy computes it on GPU.
+                    return naive_logprobs(logits.float(), labels)
                 return orig_logprobs(logits, labels, inplace_backward=inplace_backward)
 
             _patched_logprobs_from_logits._tpu_patched = True  # type: ignore[attr-defined]
@@ -124,7 +138,26 @@ def apply() -> None:
     original_all_reduce = dist.all_reduce
     original_all_gather_object = getattr(dist, "all_gather_object", None)
 
-    def _patched_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
+    def _patched_all_reduce(tensor, op=None, group=None, async_op=False):
+        # Forward `op` only when the caller passed one. Under torch.compile, dynamo rewrites the original
+        # `dist.all_reduce` into a functional collective, but it only converts a ReduceOp to its string form when
+        # the traced function is the current `dist.all_reduce` attribute (i.e. this wrapper). A forwarded
+        # `ReduceOp.SUM` default would reach `_functional_collectives.all_reduce` unconverted and fail with
+        # "'RedOpType' object has no attribute 'lower'" (e.g. vLLM's compiled tensor-parallel all-reduce).
+        if not async_op and _is_gloo_only_group_with_tpu_tensor(tensor, group):
+            cpu_tensor = tensor.detach().cpu()
+            if op is None:
+                result = original_all_reduce(cpu_tensor, group=group, async_op=False)
+            elif op == dist.ReduceOp.AVG:
+                world_size = dist.get_world_size(group=group)
+                result = original_all_reduce(cpu_tensor, op=dist.ReduceOp.SUM, group=group, async_op=False)
+                cpu_tensor.div_(world_size)
+            else:
+                result = original_all_reduce(cpu_tensor, op=op, group=group, async_op=False)
+            tensor.copy_(cpu_tensor)
+            return result
+        if op is None:
+            return original_all_reduce(tensor, group=group, async_op=async_op)
         if op != dist.ReduceOp.AVG or async_op or not _is_tpu_all_reduce(tensor, group):
             return original_all_reduce(tensor, op=op, group=group, async_op=async_op)
 

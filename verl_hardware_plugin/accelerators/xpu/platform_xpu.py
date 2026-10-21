@@ -33,14 +33,19 @@ import torch
 
 from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
-from verl_hardware_plugin.accelerators.xpu.patches import numa_affinity_patch, reduce_avg_allreduce_patch
+from verl_hardware_plugin.accelerators.xpu.patches import (
+    numa_affinity_patch,
+    ray_device_pin_patch,
+    reduce_avg_allreduce_patch,
+)
+from verl_hardware_plugin.accelerators.xpu.profilers import register_vtune
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Every monkeypatch this platform installs, applied from __init__ below. See
 # each module's own docstring for what it patches and why.
-_PATCHES = (reduce_avg_allreduce_patch, numa_affinity_patch)
+_PATCHES = (reduce_avg_allreduce_patch, ray_device_pin_patch, register_vtune, numa_affinity_patch)
 
 
 def _ensure_torch_xpu() -> bool:
@@ -234,6 +239,19 @@ class PlatformXPU(PlatformBase):
     def profiler_stop(self) -> None:
         # No-op: see profiler_start
         pass
+
+    def profiler_markers(self):
+        # Intel VTune (ITT) tracing markers. verl core asks the platform for
+        # these first, before falling back to nvtx/mstx/generic markers -- see
+        # verl/utils/profiler/__init__.py for how it discovers them.
+        from verl_hardware_plugin.accelerators.xpu.profilers import itt_profile_xpu
+
+        return (
+            itt_profile_xpu.mark_start_range,
+            itt_profile_xpu.mark_end_range,
+            itt_profile_xpu.mark_annotate,
+            itt_profile_xpu.marked_timer,
+        )
 
     # ------------------------------------------------------------------
     # Model patches

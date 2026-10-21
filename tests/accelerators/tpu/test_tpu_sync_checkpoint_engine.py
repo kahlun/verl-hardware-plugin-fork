@@ -18,7 +18,6 @@ import sys
 import threading
 from collections import namedtuple
 from types import ModuleType, SimpleNamespace
-from unittest import mock
 
 import pytest
 import ray
@@ -37,10 +36,10 @@ for _mod_name in ("uvicorn", "fastapi"):
             sys.modules[_mod_name] = _stub
 
 # Imported up front, so that no test imports (and registers) them a second time. Importing
-# tpu_checkpoint_engine also installs the CheckpointEngineManager hook that routes backend=raiden.
+# tpu_checkpoint_engine also installs the CheckpointEngineManager hook that routes backend=tpu-sync.
 import verl.checkpoint_engine.base as ckpt_base  # noqa: E402
-from verl_hardware_plugin.accelerators.tpu.engines import raiden_checkpoint_engine as raiden  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.engines import ray_weight_registry, tpu_checkpoint_engine  # noqa: E402, F401
+from verl_hardware_plugin.accelerators.tpu.engines import tpu_sync_checkpoint_engine as raiden  # noqa: E402
 from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import RayWeightRegistryState  # noqa: E402
 
 TPU_RAIDEN = "verl_hardware_plugin.accelerators.tpu.rollout.tpu_raiden"
@@ -59,8 +58,9 @@ TIMING_KEYS = {
     )
 }
 
-# A one-layer Qwen3-like model in HF naming: hidden size, vocab, MLP intermediate size, q rows, k/v rows.
-HIDDEN, VOCAB, INTERMEDIATE, Q_ROWS, KV_ROWS = 8, 16, 16, 8, 4
+# A one-layer Qwen3-like model in HF naming: hidden size, vocab, MLP intermediate size, q rows, k/v rows, and
+# KV heads (so head_dim = KV_ROWS // KV_HEADS; TP > KV_HEADS replicates KV heads like GQA in vLLM).
+HIDDEN, VOCAB, INTERMEDIATE, Q_ROWS, KV_ROWS, KV_HEADS = 8, 16, 16, 8, 4, 2
 LAYER = "model.layers.0."
 TRAINER_SHAPES = {
     "lm_head.weight": (VOCAB, HIDDEN),
@@ -166,7 +166,10 @@ class _FakeTpuSync:
                 for dim, axis in enumerate(var.sharding_spec):
                     if axis == "tp":
                         size = src.shape[dim] // var.mesh_shape[dim]
-                        src = src.narrow(dim, tp_rank * size, size)
+                        # An explicit global_shard_indices names the slice; else it is the unit's rank in the mesh.
+                        indices = getattr(var, "global_shard_indices", None)
+                        index = indices[0] if indices else tp_rank
+                        src = src.narrow(dim, index * size, size)
                 buffer.copy_(src)
 
     def modules(self) -> dict[str, ModuleType]:
@@ -291,12 +294,13 @@ class _FakeTpuSync:
 class _FakeActorWorkerGroup:
     """The trainer worker group: rank ``r`` runs ``engines[r].send_weights(weights_for_rank(r))``."""
 
-    def __init__(self, engines, weights_for_rank, events):
+    def __init__(self, engines, weights_for_rank, events, backend="tpu-sync"):
         self.engines, self.weights_for_rank, self.events = engines, weights_for_rank, events
         self.world_size = len(engines)
+        self.backend = backend
 
     def update_weights(self, global_steps=None, mode=None):
-        assert mode == "raiden"
+        assert mode == self.backend
         self.events.append("update_weights")
 
         def send(engine, rank):
@@ -326,9 +330,17 @@ class _FakeServer:
         self.global_steps = global_steps
 
 
-def _make_manager(engines, weights_for_rank, samplers, events, num_replicas=1, **raiden_kwargs):
-    """A ``CheckpointEngineManager`` stand-in with ``num_replicas`` handles to one rollout server."""
-    server = _FakeServer(samplers, events)
+def _make_manager(
+    engines, weights_for_rank, samplers, events, backend="tpu-sync", replica_samplers=None, **raiden_kwargs
+):
+    """A ``CheckpointEngineManager`` stand-in: one rollout server over ``samplers``, or, with ``replica_samplers``
+    (a list of sampler lists), one rollout server per replica over its own samplers (``replica_rank`` = position).
+
+    ``raiden_kwargs`` go to ``engine_kwargs[backend]``, where verl reads the engine kwargs of the backend. Returns
+    the manager and the first server.
+    """
+    servers = [_FakeServer(group, events) for group in (replica_samplers or [samplers])]
+    server = servers[0]
 
     async def abort_replicas():
         events.append("abort")
@@ -337,10 +349,13 @@ def _make_manager(engines, weights_for_rank, samplers, events, num_replicas=1, *
         events.append("resume")
 
     manager = SimpleNamespace(
-        backend="raiden",
-        config=SimpleNamespace(engine_kwargs={"raiden": raiden_kwargs}),
-        actor_wg=_FakeActorWorkerGroup(engines, weights_for_rank, events),
-        replicas=[SimpleNamespace(server_handle=_FakeActorHandle(server), world_size=len(samplers))] * num_replicas,
+        backend=backend,
+        config=SimpleNamespace(backend=backend, engine_kwargs={backend: raiden_kwargs}),
+        actor_wg=_FakeActorWorkerGroup(engines, weights_for_rank, events, backend=backend),
+        replicas=[
+            SimpleNamespace(server_handle=_FakeActorHandle(server), world_size=len(server.workers), replica_rank=rank)
+            for rank, server in enumerate(servers)
+        ],
         abort_replicas=abort_replicas,
         resume_generation_replicas=resume_generation_replicas,
     )
@@ -363,12 +378,15 @@ class _Linear(nn.Module):
 
 
 class _FakeVllmModel(nn.Module):
-    """One TP rank of the vLLM model: fused qkv/gate_up, column and vocab parallel on dim 0, row parallel on dim 1."""
+    """One TP rank of the vLLM model: fused qkv/gate_up, column and vocab parallel on dim 0, row parallel on dim 1.
+
+    With ``tp > KV_HEADS`` every rank holds one whole KV head (replicated on ``tp // KV_HEADS`` ranks).
+    """
 
     def __init__(self, tp, flip_o_proj=False):
         super().__init__()
         attn = nn.Module()
-        attn.qkv_proj = _Linear((Q_ROWS + 2 * KV_ROWS) // tp, HIDDEN)
+        attn.qkv_proj = _Linear(Q_ROWS // tp + 2 * KV_ROWS // min(tp, KV_HEADS), HIDDEN)
         attn.o_proj = _Linear(Q_ROWS // tp, HIDDEN, flipped=True) if flip_o_proj else _Linear(HIDDEN, Q_ROWS // tp)
         mlp = nn.Module()
         mlp.gate_up_proj = _Linear(2 * INTERMEDIATE // tp, HIDDEN)
@@ -391,16 +409,23 @@ def _expected_vllm_state(weights, rank, tp, lm_head_from_embed=False, flip_o_pro
     def rows(name):
         return weights[name].chunk(tp, dim=0)[rank]
 
+    def kv_rows(name):
+        # One whole KV head per rank once KV heads are replicated (tp > KV_HEADS); else a plain dim-0 split.
+        if tp <= KV_HEADS:
+            return rows(name)
+        return weights[name].chunk(KV_HEADS, dim=0)[rank // (tp // KV_HEADS)]
+
     def cols(name):
         return weights[name].chunk(tp, dim=1)[rank]
 
+    q_name, k_name, v_name = QKV
     o_proj = cols(LAYER + "self_attn.o_proj.weight")
     return {
         "model.embed_tokens.weight": rows("model.embed_tokens.weight"),
         "model.norm.weight": weights["model.norm.weight"],
         LAYER + "input_layernorm.weight": weights[LAYER + "input_layernorm.weight"],
         LAYER + "post_attention_layernorm.weight": weights[LAYER + "post_attention_layernorm.weight"],
-        LAYER + "self_attn.qkv_proj.weight": torch.cat([rows(name) for name in QKV]),
+        LAYER + "self_attn.qkv_proj.weight": torch.cat([rows(q_name), kv_rows(k_name), kv_rows(v_name)]),
         LAYER + "self_attn.o_proj.weight": o_proj.T if flip_o_proj else o_proj,
         LAYER + "mlp.gate_up_proj.weight": torch.cat(
             [rows(LAYER + "mlp.gate_proj.weight"), rows(LAYER + "mlp.up_proj.weight")]
@@ -426,7 +451,10 @@ def _make_sampler(module, rank, tp, model):
     sampler = module.vLLMRaidenWorkerExtension()
     sampler.rank = rank
     sampler.model_runner = SimpleNamespace(model=model)
-    sampler.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=tp))
+    sampler.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp),
+        model_config=SimpleNamespace(get_total_num_kv_heads=lambda: KV_HEADS),
+    )
     return sampler
 
 
@@ -463,8 +491,26 @@ def tpu_raiden(fake_tpu_sync, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_raiden_engine_registered():
+def test_tpu_sync_engine_registered():
+    assert ckpt_base.CheckpointEngineRegistry.get("tpu-sync") is raiden.RaidenCheckpointEngine
+    # Former name of the backend, still accepted.
     assert ckpt_base.CheckpointEngineRegistry.get("raiden") is raiden.RaidenCheckpointEngine
+
+
+@pytest.mark.parametrize(
+    ("backend", "engine_kwargs", "expected"),
+    [
+        ("tpu-sync", {"tpu-sync": {"parallelism": 4}}, {"parallelism": 4}),
+        ("raiden", {"raiden": {"parallelism": 2}}, {"parallelism": 2}),
+        # Like verl's trainer-side engine, only the entry of the configured backend counts.
+        ("tpu-sync", {"raiden": {"parallelism": 2}}, {}),
+        ("tpu-sync", {}, {}),
+    ],
+)
+def test_raiden_engine_kwargs_follow_configured_backend(backend, engine_kwargs, expected):
+    config = SimpleNamespace(backend=backend, engine_kwargs=engine_kwargs)
+    assert raiden._raiden_engine_kwargs(config, backend) == expected
+    assert raiden._raiden_engine_kwargs(config) == expected
 
 
 def test_engine_kwargs(monkeypatch):
@@ -567,23 +613,6 @@ def test_as_bool(value, expected):
     assert raiden._as_bool(value) is expected
 
 
-def test_tile_alignment_and_skip_tiling_api():
-    assert raiden.raiden_is_tile_aligned([8, 128])
-    assert raiden.raiden_is_tile_aligned([2, 16, 256])
-    assert not raiden.raiden_is_tile_aligned([4, 128])
-    assert not raiden.raiden_is_tile_aligned([8, 64])
-    assert not raiden.raiden_is_tile_aligned([1024])
-
-    # The setter's name differs across tpu_sync builds; builds with neither are left alone.
-    test_only_api = SimpleNamespace(test_only_set_skip_tiling=mock.Mock())
-    public_api = SimpleNamespace(set_skip_tiling=mock.Mock())
-    raiden.apply_raiden_skip_tiling(test_only_api, [True])
-    raiden.apply_raiden_skip_tiling(public_api, [False])
-    raiden.apply_raiden_skip_tiling(SimpleNamespace(), [True])
-    test_only_api.test_only_set_skip_tiling.assert_called_once_with([True])
-    public_api.set_skip_tiling.assert_called_once_with([False])
-
-
 def test_validate_and_sanitize_tensors():
     weight = torch.arange(6.0).reshape(2, 3)
     named = [
@@ -667,7 +696,7 @@ def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu
     assert [t.data_ptr() for t in ws.tensors] == [weights[n].data_ptr() for n in names]  # bound in place
     assert (ws.parallelism, ws.bind_ip) == (8, "10.0.0.1")
     assert ws.kwargs == {"unsafe_skip_buffer_lock": True, "auto_h2d": False}
-    assert ws.d2h_calls == 1  # staged in host memory before send_weights returns
+    assert ws.d2h_calls == 0  # the controller-driven push does the D2H; send_weights only binds
     registration = fake_tpu_sync.registrations[RaidenId("trainer", "0", "weights")]
     assert registration.address == "10.0.0.1:7777"
     assert (registration.mesh_shape, registration.mesh_axes) == ([1, 1], ["fsdp", "tp"])
@@ -686,14 +715,14 @@ def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu
     assert fake_tpu_sync.registry_state.get_global_shapes() == {n: list(s) for n, s in TRAINER_SHAPES.items()}
 
     # After the transfer, release_sync_buffers unbinds the send tensors but keeps the synchronizer and its
-    # controller registration; the next sync rebinds the new tensors and stages them, without re-registering.
+    # controller registration; the next sync rebinds the new tensors without re-registering.
     engine.release_sync_buffers()
     assert engine._trainer_raiden_ws is ws
     assert (ws.unbind_calls, ws.bound, engine._bound_tensors) == (1, False, None)
     new_weights = _trainer_weights(seed=1)
     asyncio.run(engine.send_weights(iter(new_weights.items()), global_steps=2))
     assert fake_tpu_sync.synchronizers == [ws]
-    assert (ws.bind_calls, ws.bound, ws.d2h_calls) == (1, True, 2)
+    assert (ws.bind_calls, ws.bound, ws.d2h_calls) == (1, True, 0)
     assert [t.data_ptr() for t in ws.tensors] == [new_weights[n].data_ptr() for n in names]
     assert fake_tpu_sync.registrations[RaidenId("trainer", "0", "weights")] is registration
 
@@ -707,7 +736,7 @@ def test_send_weights_registers_full_tensors_and_recreates_synchronizer(fake_tpu
     asyncio.run(engine.send_weights(iter(fewer.items()), global_steps=4))
     assert len(fake_tpu_sync.synchronizers) == 2
     new_ws = fake_tpu_sync.synchronizers[1]
-    assert engine._trainer_raiden_ws is new_ws and new_ws.d2h_calls == 1
+    assert engine._trainer_raiden_ws is new_ws and new_ws.d2h_calls == 0
     registration = fake_tpu_sync.registrations[RaidenId("trainer", "0", "weights")]
     assert registration.data_addresses == [f"10.0.0.1:{new_ws.local_port}"]
     assert [var.name for var in registration.variables] == sorted(fewer)
@@ -814,9 +843,14 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
     assert set(metrics) == TIMING_KEYS and min(metrics.values()) >= 0
     (transfer,) = fake_tpu_sync.transfers
     assert transfer["src_units"] == [RaidenId("trainer", str(r), "weights") for r in range(trainer_ranks)]
-    assert transfer["dst_units"] == [RaidenId("sampler", str(r), "weights") for r in range(tp)]
+    assert transfer["dst_units"] == [RaidenId("sampler0", str(r), "weights") for r in range(tp)]
     assert (transfer["parallelism"], transfer["req_id"], transfer["dst_mem_type"]) == (4, "verl_step_0", "DRAM")
-    assert [sampler._raiden_ws.listener_port for sampler in samplers] == [12000, 12001]
+    # The listener port is OS-assigned (0 at creation) and the bound port is what the controller learns.
+    listener_ports = [sampler._raiden_ws.listener_port for sampler in samplers]
+    assert len(set(listener_ports)) == tp and all(port > 0 for port in listener_ports)
+    for rank, sampler in enumerate(samplers):
+        registration = fake_tpu_sync.registrations[RaidenId("sampler0", str(rank), "weights")]
+        assert registration.listener_address == f"10.0.0.1:{sampler._raiden_ws.listener_port}"
     assert [sampler._raiden_ws.parallelism for sampler in samplers] == [4, 4]
     assert ("lm_head.weight" in fake_tpu_sync.registry_state.get_global_shapes()) is not tie_word_embeddings
     # Released after the transfer: the send tensors are unbound, the synchronizers are kept for the next sync.
@@ -846,26 +880,35 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
     assert [sampler._raiden_ws.h2d_calls for sampler in samplers] == [2, 2]
     sampler_synchronizers = [sampler._raiden_ws for sampler in samplers]
     trainer_synchronizers = [ws for ws in fake_tpu_sync.synchronizers if ws not in sampler_synchronizers]
-    assert [ws.d2h_calls for ws in trainer_synchronizers] == [2] * trainer_ranks  # one synchronizer per rank
+    assert len(trainer_synchronizers) == trainer_ranks  # one synchronizer per rank
+    assert [ws.d2h_calls for ws in trainer_synchronizers] == [0] * trainer_ranks  # D2H belongs to the push
     bind_state = [(ws.bind_calls, ws.unbind_calls, ws.bound) for ws in trainer_synchronizers]
     assert bind_state == [(1, 2, False)] * trainer_ranks  # rebound once, unbound after each transfer
     assert "RAIDEN PARITY VERIFIED | Step 1" in caplog.text
     assert "MISMATCH" not in caplog.text
 
 
-def test_update_raiden_weights_installs_tp_shards_into_transposed_weights(fake_tpu_sync, tpu_raiden):
-    """Every trainer rank registers the full tensors; vLLM ranks get TP shards, also of transposed parameters."""
+@pytest.mark.parametrize("backend", ["tpu-sync", "raiden"])
+def test_update_raiden_weights_installs_tp_shards_into_transposed_weights(fake_tpu_sync, tpu_raiden, backend):
+    """Every trainer rank registers the full tensors; vLLM ranks get TP shards, also of transposed parameters.
+
+    Also with the deprecated backend name ``raiden``, whose engine kwargs live under ``engine_kwargs.raiden``.
+    """
     tp, trainer_ranks = 2, 4
     weights = _trainer_weights()
     models = [_FakeVllmModel(tp, flip_o_proj=True) for _ in range(tp)]
+    samplers = [_make_sampler(tpu_raiden, rank, tp, model) for rank, model in enumerate(models)]
     manager, _ = _make_manager(
         [_trainer_engine(rank) for rank in range(trainer_ranks)],
         lambda rank: iter(weights.items()),
-        [_make_sampler(tpu_raiden, rank, tp, model) for rank, model in enumerate(models)],
+        samplers,
         [],
+        backend=backend,
+        parallelism=3,
     )
     asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
 
+    assert [sampler._raiden_ws.parallelism for sampler in samplers] == [3] * tp
     for rank, model in enumerate(models):
         _assert_state(model, _expected_vllm_state(weights, rank, tp, flip_o_proj=True))
     for rank in range(trainer_ranks):
@@ -896,11 +939,53 @@ def test_parity_check_reports_mismatch(fake_tpu_sync, tpu_raiden, caplog):
     assert "model.embed_tokens.weight" in caplog.text
 
 
-def test_update_raiden_weights_requires_single_replica(fake_tpu_sync):
-    manager, _ = _make_manager([], lambda rank: iter(()), [], [], num_replicas=2)
-    with pytest.raises(NotImplementedError, match="single rollout replica"):
+def test_update_raiden_weights_syncs_several_replicas_in_one_transfer(fake_tpu_sync, tpu_raiden, caplog):
+    """Two TP=2 replicas: a job name and a port range per replica, one transfer, the parity check per replica."""
+    tp, trainer_ranks, num_replicas = 2, 2, 2
+    weights = _trainer_weights()
+    models = [[_FakeVllmModel(tp) for _ in range(tp)] for _ in range(num_replicas)]
+    samplers = [[_make_sampler(tpu_raiden, rank, tp, model) for rank, model in enumerate(group)] for group in models]
+    events: list = []
+    manager, _ = _make_manager(
+        [_trainer_engine(rank, verify_parity=True) for rank in range(trainer_ranks)],
+        lambda rank: iter(weights.items()),
+        None,
+        events,
+        replica_samplers=samplers,
+        verify_parity=True,
+    )
+    with caplog.at_level(logging.INFO, logger=raiden.__name__):
         asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
-    assert fake_tpu_sync.servers_started == 0
+
+    for group in models:
+        for rank, model in enumerate(group):
+            _assert_state(model, _expected_vllm_state(weights, rank, tp))
+    assert events.count("init_raiden_sync_on_worker") == num_replicas
+    (transfer,) = fake_tpu_sync.transfers
+    assert transfer["src_units"] == [RaidenId("trainer", str(r), "weights") for r in range(trainer_ranks)]
+    assert transfer["dst_units"] == [
+        RaidenId(f"sampler{replica}", str(rank), "weights") for replica in range(num_replicas) for rank in range(tp)
+    ]
+    assert transfer["req_id"] == "verl_step_1"
+    listener_ports = [sampler._raiden_ws.listener_port for group in samplers for sampler in group]
+    assert len(set(listener_ports)) == num_replicas * tp  # OS-assigned: distinct even when replicas share a host
+    assert "[RAIDEN PARITY VERIFIED | Step 1 | replica 0]" in caplog.text
+    assert "[RAIDEN PARITY VERIFIED | Step 1 | replica 1]" in caplog.text
+    assert "MISMATCH" not in caplog.text
+
+    # A replica with wrong weights is reported by name, at ERROR level; the other one still verifies.
+    samplers[1][0]._raiden_staging["model.embed_tokens.weight"].zero_()
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger=raiden.__name__):
+        asyncio.run(raiden._verify_parity_async(manager, global_steps=1))
+    assert "[RAIDEN PARITY MISMATCH | Step 1 | replica 1]" in caplog.text
+    assert "replica 0" not in caplog.text
+
+
+def test_sampler_job_names_follow_replica_rank():
+    # Keyed on replica_rank, so a replica keeps its name when others are added or removed.
+    assert raiden._sampler_job_name(SimpleNamespace(replica_rank=3), 0) == "sampler3"
+    assert raiden._sampler_job_name(SimpleNamespace(), 2) == "sampler2"  # no replica_rank: list position
 
 
 def test_wait_for_registration_times_out():
@@ -914,7 +999,8 @@ def test_wait_for_registration_times_out():
     assert "Missing Sampler: [RaidenId(job_name='sampler', job_replica_id='0', data_name='weights')]" in message
 
 
-def test_manager_hook_routes_raiden_backend(monkeypatch):
+@pytest.mark.parametrize("backend", ["tpu-sync", "raiden"])
+def test_manager_hook_routes_tpu_sync_backend(monkeypatch, backend):
     calls = []
 
     async def fake_update_raiden_weights(manager, global_steps=None):
@@ -923,9 +1009,9 @@ def test_manager_hook_routes_raiden_backend(monkeypatch):
 
     monkeypatch.setattr(raiden, "update_raiden_weights", fake_update_raiden_weights)
     assert getattr(ckpt_base, "_verl_tpu_ckpt_patched", False)
-    result = ckpt_base.CheckpointEngineManager.update_weights(SimpleNamespace(backend="raiden"), global_steps=3)
+    result = ckpt_base.CheckpointEngineManager.update_weights(SimpleNamespace(backend=backend), global_steps=3)
     assert result == {"timing_s/tpu-sync/total_sync": 1.0}
-    assert calls == [("raiden", 3)]
+    assert calls == [(backend, 3)]
 
 
 # ---------------------------------------------------------------------------
@@ -934,12 +1020,66 @@ def test_manager_hook_routes_raiden_backend(monkeypatch):
 
 
 def test_sampler_sharding(tpu_raiden):
-    shard = tpu_raiden._sampler_sharding
-    assert shard(LAYER + "self_attn.o_proj.weight", [8, 16], 2) == (["", "tp"], [8, 8])
-    assert shard(LAYER + "mlp.down_proj.weight", [8, 16], 4) == (["", "tp"], [8, 4])
-    assert shard(LAYER + "self_attn.q_proj.weight", [16, 8], 2) == (["tp", ""], [8, 8])
-    assert shard("model.embed_tokens.weight", [15, 8], 2) == (["", ""], [15, 8])  # indivisible: replicated
-    assert shard("model.norm.weight", [8], 2) == ([""], [8])
+    def shard(name, shape, tp, **kwargs):
+        s = tpu_raiden._sampler_sharding(name, shape, tp, **kwargs)
+        return s.sharding_spec, s.local_shape, s.mesh_shape, s.global_shard_indices, s.replicas
+
+    assert shard(LAYER + "self_attn.o_proj.weight", [8, 16], 2) == (["", "tp"], [8, 8], [1, 2], [], 1)
+    assert shard(LAYER + "mlp.down_proj.weight", [8, 16], 4) == (["", "tp"], [8, 4], [1, 4], [], 1)
+    assert shard(LAYER + "self_attn.q_proj.weight", [16, 8], 2) == (["tp", ""], [8, 8], [2, 1], [], 1)
+    # indivisible: replicated on every rank
+    assert shard("model.embed_tokens.weight", [15, 8], 2) == (["", ""], [15, 8], [1, 1], [], 2)
+    assert shard("model.norm.weight", [8], 2) == ([""], [8], [1], [], 2)
+
+
+def test_sampler_sharding_gqa_kv_heads(tpu_raiden):
+    """With tp_size > num_kv_heads, k/v are sliced per KV head and every rank names the head it holds."""
+
+    def shard(name, shape, tp, rank, kv_heads):
+        s = tpu_raiden._sampler_sharding(name, shape, tp, tp_rank=rank, num_kv_heads=kv_heads)
+        return s.sharding_spec, s.local_shape, s.mesh_shape, s.global_shard_indices, s.replicas
+
+    k, v, q = (LAYER + f"self_attn.{p}_proj.weight" for p in "kvq")
+    # Qwen3-32B at TP=32: 8 KV heads of 128 rows, each on 4 ranks.
+    assert shard(k, [1024, 5120], 32, 13, 8) == (["tp", ""], [128, 5120], [8, 1], [3], 4)
+    assert shard(v, [1024, 5120], 32, 31, 8) == (["tp", ""], [128, 5120], [8, 1], [7], 4)
+    # q is not replicated, and neither are k/v while tp_size <= num_kv_heads.
+    assert shard(q, [8192, 5120], 32, 13, 8) == (["tp", ""], [256, 5120], [32, 1], [], 1)
+    assert shard(k, [1024, 5120], 8, 3, 8) == (["tp", ""], [128, 5120], [8, 1], [], 1)
+    # Without the KV head count (older callers) k/v fall back to the plain dim-0 split.
+    assert shard(k, [1024, 5120], 32, 13, None) == (["tp", ""], [32, 5120], [32, 1], [], 1)
+
+
+@pytest.mark.parametrize("verify_parity", [False, True])
+def test_update_raiden_weights_gqa_replicated_kv_heads(fake_tpu_sync, tpu_raiden, caplog, verify_parity):
+    """TP=4 with 2 KV heads: each rank receives one whole KV head, and the parity check counts each head once."""
+    tp = 4
+    assert tp > KV_HEADS
+    weights = _trainer_weights()
+    models = [_FakeVllmModel(tp) for _ in range(tp)]
+    samplers = [_make_sampler(tpu_raiden, rank, tp, model) for rank, model in enumerate(models)]
+    manager, _ = _make_manager(
+        [_trainer_engine(rank, verify_parity=verify_parity) for rank in range(2)],
+        lambda rank: iter(weights.items()),
+        samplers,
+        [],
+        verify_parity=verify_parity,
+    )
+    with caplog.at_level(logging.INFO, logger=raiden.__name__):
+        asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
+
+    for rank, model in enumerate(models):
+        _assert_state(model, _expected_vllm_state(weights, rank, tp))
+    for rank in range(tp):
+        variables = {
+            v.name: v for v in fake_tpu_sync.registrations[RaidenId("sampler0", str(rank), "weights")].variables
+        }
+        for name in QKV[1:]:
+            assert (variables[name].mesh_shape, variables[name].global_shard_indices) == ([KV_HEADS, 1], [rank // 2])
+        assert (variables[QKV[0]].mesh_shape, variables[QKV[0]].global_shard_indices) == ([tp, 1], [])
+    if verify_parity:
+        assert "RAIDEN PARITY VERIFIED | Step 1" in caplog.text
+        assert "MISMATCH" not in caplog.text
 
 
 def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, tpu_raiden):
@@ -955,24 +1095,44 @@ def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, tpu_raide
     assert sampler.init_raiden_sync_on_worker(parallelism=4) is True
 
     (ws,) = fake_tpu_sync.synchronizers
-    assert (ws.listener_port, ws.parallelism, ws.bind_ip) == (12001, 4, "10.0.0.1")
+    assert (ws.parallelism, ws.bind_ip) == (4, "10.0.0.1")
+    assert ws.listener_port > 0  # OS-assigned (requested as 0), registered with the controller below
     assert [tuple(t.shape) for t in ws.tensors] == [(8, 64), (128, 128), (128,)]
     assert all(t.dtype == torch.bfloat16 for t in ws.tensors)
-    assert ws.skip_tiling == [False, True, False]  # only (8, 128)-tile aligned 2-D shards skip the tiling pass
-    registration = fake_tpu_sync.registrations[RaidenId("sampler", "1", "weights")]
+    assert ws.skip_tiling is None  # skip-tiling is left to the planner, which sees both sides of the transfer
+    registration = fake_tpu_sync.registrations[RaidenId("sampler0", "1", "weights")]
     assert registration.address == "10.0.0.2:7777"
     assert (registration.mesh_shape, registration.mesh_axes) == ([1, 2], ["fsdp", "tp"])
     assert registration.data_addresses == [f"10.0.0.1:{ws.local_port}"]
-    assert registration.listener_address == "10.0.0.1:12001"
-    assert [(v.name, v.shape, v.mesh_shape, v.sharding_spec) for v in registration.variables] == [
-        (LAYER + "self_attn.k_proj.weight", [16, 64], [2, 1], ["tp", ""]),
-        (LAYER + "self_attn.o_proj.weight", [128, 256], [1, 2], ["", "tp"]),
-        ("model.norm.weight", [128], [1], [""]),
+    assert registration.listener_address == f"10.0.0.1:{ws.listener_port}"
+    assert [
+        (v.name, v.shape, v.mesh_shape, v.sharding_spec, v.global_shard_indices) for v in registration.variables
+    ] == [
+        (LAYER + "self_attn.k_proj.weight", [16, 64], [2, 1], ["tp", ""], []),
+        (LAYER + "self_attn.o_proj.weight", [128, 256], [1, 2], ["", "tp"], []),
+        ("model.norm.weight", [128], [1], [""], []),
     ]
+    assert sampler._raiden_replicas == {
+        LAYER + "self_attn.k_proj.weight": 1,
+        LAYER + "self_attn.o_proj.weight": 1,
+        "model.norm.weight": 2,
+    }
 
     # Later syncs reuse the receive buffers and the registration.
     assert sampler.init_raiden_sync_on_worker(parallelism=4) is True
     assert len(fake_tpu_sync.synchronizers) == 1
+
+
+def test_sampler_init_registers_under_its_replica_job_name(fake_tpu_sync, tpu_raiden):
+    fake_tpu_sync.registry_state.set_controller_address("10.0.0.2:7777")
+    fake_tpu_sync.registry_state.set_global_shapes({"model.norm.weight": [128]})
+    sampler = _make_sampler(tpu_raiden, rank=1, tp=2, model=_FakeVllmModel(2))
+    assert sampler.init_raiden_sync_on_worker(parallelism=4, job_name="sampler1") is True
+
+    (ws,) = fake_tpu_sync.synchronizers
+    assert RaidenId("sampler0", "1", "weights") not in fake_tpu_sync.registrations
+    registration = fake_tpu_sync.registrations[RaidenId("sampler1", "1", "weights")]
+    assert registration.listener_address == f"10.0.0.1:{ws.listener_port}"
 
 
 def test_sampler_init_times_out_without_registry(fake_tpu_sync, tpu_raiden, monkeypatch):

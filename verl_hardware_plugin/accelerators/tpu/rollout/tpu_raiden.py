@@ -4,8 +4,8 @@
 """vLLM worker extension that receives the trainer's weights over Raiden (tpu-sync) on TPU.
 
 ``TPUvLLMHttpServer`` passes this class to vLLM as ``worker_extension_cls`` when
-``actor_rollout_ref.rollout.checkpoint_engine.backend=raiden``. The driver
-(``update_raiden_weights`` in ``verl_hardware_plugin.accelerators.tpu.engines.raiden_checkpoint_engine``) calls its
+``actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync``. The driver
+(``update_raiden_weights`` in ``verl_hardware_plugin.accelerators.tpu.engines.tpu_sync_checkpoint_engine``) calls its
 methods on every vLLM worker through ``collective_rpc``:
 
 1. ``init_raiden_sync_on_worker``: allocate TP-sharded receive buffers for the tensors the trainer
@@ -18,15 +18,16 @@ This module imports vLLM (through the upstream worker extension), so only vLLM w
 """
 
 import logging
+import math
 import os
 import time
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import ray
 import torch
 
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
-from verl_hardware_plugin.accelerators.tpu.engines import raiden_checkpoint_engine as raiden
+from verl_hardware_plugin.accelerators.tpu.engines import tpu_sync_checkpoint_engine as raiden
 from verl_hardware_plugin.accelerators.tpu.engines.ray_weight_registry import get_ray_weight_registry
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_checkpoint_engine import (
     _get_parent_module,
@@ -37,14 +38,26 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_checkpoint_engine import 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-# Each rollout worker receives transfers on this port plus its rank.
-RAIDEN_SAMPLER_LISTENER_BASE_PORT = 12000
 # How long a rollout worker waits for the controller address and the trainer's tensor shapes.
 _REGISTRY_POLL_ATTEMPTS = 30
 _REGISTRY_POLL_INTERVAL_S = 0.5
 # Row-parallel layers: vLLM shards their input dimension (dim 1) across TP ranks; every other 2-D weight
 # whose output dimension divides evenly is sharded on dim 0.
 _ROW_PARALLEL_SUFFIXES = (".o_proj.weight", ".down_proj.weight")
+# GQA key/value projections: sharded per KV head when vLLM replicates KV heads (tp_size > num_kv_heads).
+_KV_PROJ_SUFFIXES = (".self_attn.k_proj.weight", ".self_attn.v_proj.weight")
+
+
+class _SamplerSlice(NamedTuple):
+    """How one vLLM TP rank holds a trainer tensor (see ``_sampler_sharding``)."""
+
+    sharding_spec: list[str]
+    local_shape: list[int]
+    mesh_shape: list[int]
+    global_shard_indices: list[int]
+    replicas: int
+
+
 # vLLM fuses these trainer tensors into one parameter: (fused suffix, source suffixes in concat order).
 _FUSED_TARGETS = (
     (
@@ -60,26 +73,47 @@ _FUSED_TARGETS = (
 )
 
 
-def _sampler_sharding(name: str, global_shape: list[int], tp_size: int) -> tuple[list[str], list[int]]:
-    """Returns ``(sharding_spec, local_shape)`` of a trainer tensor on one vLLM TP rank."""
+def _sampler_sharding(
+    name: str, global_shape: list[int], tp_size: int, tp_rank: int = 0, num_kv_heads: Optional[int] = None
+) -> _SamplerSlice:
+    """Returns the slice of a trainer tensor that one vLLM TP rank holds.
+
+    With GQA and ``tp_size > num_kv_heads``, vLLM replicates each KV head on ``tp_size // num_kv_heads`` ranks,
+    so a dim-0 split of k_proj / v_proj over ``tp_size`` would hand every rank a fraction of a head. Those are
+    registered as one slice per KV head instead, and ``global_shard_indices`` names the head this rank holds
+    (ranks sharing a head receive the same slice). E.g. Qwen3-32B (8 KV heads) at TP=32: k_proj [1024, 5120]
+    -> mesh [8, 1], local [128, 5120], rank 13 -> slice 3.
+    """
     spec_axes = [""] * len(global_shape)
     local_shape = list(global_shape)
+    tp_axis_size = tp_size  # number of slices along the "tp" mesh axis
+    global_shard_indices: list[int] = []  # empty: tpu-sync derives this rank's slice from the mesh geometry
     if len(global_shape) == 2:
         if any(name.endswith(s) for s in _ROW_PARALLEL_SUFFIXES):
             # Row parallel: partition input dimension (dim 1) across TP ranks
             spec_axes = ["", "tp"]
             local_shape[1] = global_shape[1] // tp_size
+        elif num_kv_heads is not None and num_kv_heads < tp_size and name.endswith(_KV_PROJ_SUFFIXES):
+            # GQA with replicated KV heads (see above): one slice per KV head.
+            spec_axes = ["tp", ""]
+            tp_axis_size = num_kv_heads
+            local_shape[0] = global_shape[0] // num_kv_heads
+            global_shard_indices = [tp_rank // (tp_size // num_kv_heads)]
         elif global_shape[0] % tp_size == 0:
             # Column parallel or vocab parallel: partition output dimension (dim 0) across TP ranks
             spec_axes = ["tp", ""]
             local_shape[0] = global_shape[0] // tp_size
-    return spec_axes, local_shape
+    mesh_shape = [tp_axis_size if axis == "tp" else 1 for axis in spec_axes]
+    # Number of TP ranks holding this same slice: 1 for a plain split, tp_size // num_kv_heads for GQA k/v,
+    # tp_size for unsharded tensors. The norm parity check divides by it when summing over ranks.
+    replicas = tp_size // math.prod(mesh_shape)
+    return _SamplerSlice(spec_axes, local_shape, mesh_shape, global_shard_indices, replicas)
 
 
 class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
     """vLLM Worker Extension for Google Cloud TPU with Raiden P2P weight synchronization.
 
-    Workloads using the 'raiden' checkpoint engine for high-speed TPU weight sync
+    Workloads using the 'tpu-sync' checkpoint engine for high-speed TPU weight sync
     must use this worker extension to bind TPU model tensors with WeightSynchronizer
     and orchestrate dynamic zero-copy H2D DMA transfers during rollout.
     """
@@ -105,11 +139,15 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             f"global shapes found in RayWeightRegistry after timeout"
         )
 
-    def init_raiden_sync_on_worker(self, parallelism: int = raiden.RAIDEN_DEFAULT_PARALLELISM) -> bool:
+    def init_raiden_sync_on_worker(
+        self, parallelism: int = raiden.RAIDEN_DEFAULT_PARALLELISM, job_name: str = "sampler0"
+    ) -> bool:
         """Initialize Raiden WeightSynchronizer listener and register with central RaidenController.
 
-        Only the first call does work: the receive buffers, the synchronizer and the registration are
-        reused by every later sync.
+        ``job_name`` is the Raiden job this worker's replica registers under (the driver names every rollout
+        replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do not collide on
+        the controller. Only the first call does work: the receive buffers, the synchronizer and the
+        registration are reused by every later sync.
         """
         if getattr(self, "_raiden_ws", None) is not None:
             return True
@@ -123,7 +161,9 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         bind_ip = ray.util.get_node_ip_address().strip("[]")
         rank_val = getattr(self, "rank", 0)
-        listener_port = RAIDEN_SAMPLER_LISTENER_BASE_PORT + rank_val
+        # The listener port is assigned by the OS, as on the trainer side, and registered with the controller
+        # below; fixed ``base + rank`` ports collided when two replicas shared a host.
+        listener_port = 0
 
         # 1. Fetch RaidenController address and un-fused global shapes from RayWeightRegistry
         controller_addr, global_shapes_map = self._wait_for_raiden_registry(rank_val)
@@ -148,34 +188,38 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
         staging_tensors = {}
         variable_protos = []
         valid_params = []
-        skip_tiling_plan = []
+        replicas = {}
+        # Total KV heads of the model, to slice k_proj / v_proj per KV head when vLLM replicates them. rank_val is
+        # this worker's TP rank: a single rollout replica without pipeline parallelism, as the registration below
+        # ("sampler/<rank>" on mesh [1, tp_size]) already assumes.
+        num_kv_heads = worker.vllm_config.model_config.get_total_num_kv_heads()
 
         for idx, (name, g_shape) in enumerate(sorted(global_shapes_map.items(), key=lambda x: x[0])):
             g_shape = list(g_shape)
-            spec_axes, local_shape = _sampler_sharding(name, g_shape, tp_size)
-            sharding_mesh = [tp_size if axis == "tp" else 1 for axis in spec_axes]
+            shard = _sampler_sharding(name, g_shape, tp_size, tp_rank=rank_val, num_kv_heads=num_kv_heads)
+            replicas[name] = shard.replicas
 
             # Allocate a local staging buffer with matching layout (the trainer sends bf16)
-            t = torch.empty(local_shape, dtype=torch.bfloat16, device=torch.device(raiden.RAIDEN_DEVICE))
+            t = torch.empty(shard.local_shape, dtype=torch.bfloat16, device=torch.device(raiden.RAIDEN_DEVICE))
             staging_tensors[name] = t
             valid_params.append((name, t))
-            # Tile-aligned local shards can skip the CPU (de)tiling pass and DMA straight to HBM.
-            skip_tiling_plan.append(raiden.raiden_is_tile_aligned(local_shape))
 
             variable_protos.append(
                 raiden_service_pb2.VariableMetadataProto(
                     name=name,
                     shape=g_shape,
-                    mesh_shape=sharding_mesh,
-                    layout=list(range(len(local_shape) - 1, -1, -1)),
+                    mesh_shape=shard.mesh_shape,
+                    layout=list(range(len(shard.local_shape) - 1, -1, -1)),
                     item_size=t.element_size(),
                     layer_idx=idx,
-                    sharding_spec=spec_axes,
+                    sharding_spec=shard.sharding_spec,
+                    global_shard_indices=shard.global_shard_indices,
                 )
             )
 
         self._raiden_staging = staging_tensors
         self._sorted_vllm_params = valid_params
+        self._raiden_replicas = replicas
 
         raiden.tpu_synchronize()
 
@@ -193,12 +237,17 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             bind_ip=bind_ip,
         )
 
-        self._skip_tiling_plan = skip_tiling_plan
-        raiden.apply_raiden_skip_tiling(self._raiden_ws, skip_tiling_plan)
+        # Whether a tensor can skip the CPU (de)tiling pass is decided by Raiden's planner per transfer, from the
+        # source and destination slices together, and delivered to this listener with the transfer. Do not set it
+        # here from the local shape alone: both ends must make the same choice, and when they disagree (the
+        # sender de-tiles to row-major, h2d() copies those bytes raw into tiled HBM) the weights come out permuted
+        # while every norm stays unchanged. With full trainer tensors the local guess usually matches the planner,
+        # but not once the trainer sends shards that are not 8-row aligned (e.g. Qwen3's embedding at 32+ FSDP
+        # ranks).
 
         try:
             ctrl_client = raiden_controller.RaidenControllerClientFacade(controller_addr)
-            unit_id = raiden_controller.RaidenId("sampler", str(rank_val), "weights")
+            unit_id = raiden_controller.RaidenId(job_name, str(rank_val), "weights")
             ctrl_client.register_work_unit(
                 unit_id,
                 [f"{bind_ip}:{self._raiden_ws.local_port}"],
@@ -212,7 +261,7 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             raise
         logger.info(
             f"Raiden Sampler Rank {rank_val} bound {len(valid_params)} dynamic staging tensors and registered "
-            f"directly with RaidenController ({controller_addr}): mesh_shape=[1, {tp_size}], "
+            f"directly with RaidenController ({controller_addr}) as {job_name}/{rank_val}: mesh_shape=[1, {tp_size}], "
             f"data_port={self._raiden_ws.local_port}, listener_port={self._raiden_ws.listener_port}"
         )
 
@@ -233,9 +282,8 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         t_start = time.perf_counter()
         t_h2d_start = time.perf_counter()
-        # Re-apply the skip_tiling plan right before H2D: the network listener overwrites it with its default.
-        if getattr(self, "_skip_tiling_plan", None):
-            raiden.apply_raiden_skip_tiling(self._raiden_ws, self._skip_tiling_plan)
+        # h2d() applies the skip_tiling plan the listener received with this transfer (see
+        # init_raiden_sync_on_worker); nothing must override it here.
         self._raiden_ws.h2d()
         t_h2d = time.perf_counter() - t_h2d_start
 
@@ -320,4 +368,6 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         res = raiden.compute_tensor_stats(self._sorted_vllm_params)
         res["rank"] = getattr(self, "rank", 0)
+        # How many TP ranks hold each tensor's slice, so the parity check counts every slice once.
+        res["replicas"] = dict(getattr(self, "_raiden_replicas", None) or {})
         return res
