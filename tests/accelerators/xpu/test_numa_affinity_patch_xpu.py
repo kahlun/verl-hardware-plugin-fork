@@ -27,7 +27,7 @@ from types import ModuleType
 import pytest
 
 PATCH_PATH = (
-    Path(__file__).resolve().parents[1]
+    Path(__file__).resolve().parents[3]
     / "verl_hardware_plugin"
     / "accelerators"
     / "xpu"
