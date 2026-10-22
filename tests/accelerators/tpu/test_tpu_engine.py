@@ -3,8 +3,11 @@
 
 """Unit tests for the TPU TorchTitan engine utilities on CPU."""
 
-import importlib
+import ast
 import os
+import sys
+import types
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -21,24 +24,53 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     TPUSplashAttention,
     TPUVarlenAttention,
-    apply_splash_attention_tpu,
     bucket_length,
     configure_torch_compile_for_tpu,
     extend_torchtitan_engine_config,
-    force_sum_reduction_on_all_fsdp_modules,
     get_tpu_seq_bucket_size,
+    get_tpu_simple_fsdp_parallelize_fn,
+    init_states_without_simple_fsdp_parametrization,
+    install_tpu_attention,
     pad_packed_inputs_for_tpu,
     prepare_tpu_loss_inputs,
-    replace_varlen_attention_with_tpu_attention,
     resolve_tpu_torchtitan_options,
     splash_block_size_for,
     unwrap_metadata,
 )
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     PlatformTPU,
-    patch_ray_worker,
     resolve_tpu_topology_bounds,
 )
+
+
+def _fake_torchtitan_modules() -> dict[str, types.ModuleType]:
+    """Stand-ins for the two torchtitan modules these CPU tests touch, for ``mock.patch.dict(sys.modules, ...)``.
+
+    The TPU engine imports google-pytorch/torchtitan lazily, and this repo's CPU test workflow does not install it.
+    """
+    attention = types.ModuleType("torchtitan.models.common.attention")
+    attention.VarlenInnerAttention = type("VarlenInnerAttention", (torch.nn.Module,), {})  # type: ignore[attr-defined]
+
+    simple_fsdp = types.ModuleType("torchtitan.experiments.graph_trainer.simple_fsdp")
+    simple_fsdp._active_parametrization = True  # type: ignore[attr-defined]
+
+    @contextmanager
+    def disable_active_parametrization():
+        # Like torchtitan's: not reentrant, it always re-enables the parametrization on exit.
+        try:
+            simple_fsdp._active_parametrization = False  # type: ignore[attr-defined]
+            yield
+        finally:
+            simple_fsdp._active_parametrization = True  # type: ignore[attr-defined]
+
+    simple_fsdp.disable_active_parametrization = disable_active_parametrization  # type: ignore[attr-defined]
+    graph_trainer = types.ModuleType("torchtitan.experiments.graph_trainer")
+    graph_trainer.simple_fsdp = simple_fsdp  # type: ignore[attr-defined]
+    return {
+        attention.__name__: attention,
+        graph_trainer.__name__: graph_trainer,
+        simple_fsdp.__name__: simple_fsdp,
+    }
 
 
 def test_bucket_length_and_env_override():
@@ -59,66 +91,48 @@ def test_unwrap_metadata():
     assert unwrap_metadata("flex") == "flex"
 
 
-def test_pad_packed_inputs_for_tpu_builds_4d_document_causal_mask():
+def test_pad_packed_inputs_for_tpu_pads_to_bucket_and_aligned_length():
     # Two packed documents of lengths 3 and 2 -> orig_seq_len = 5
-    input_ids = torch.nested.nested_tensor(
-        [torch.tensor([10, 11, 12]), torch.tensor([20, 21])],
-        layout=torch.jagged,
-    )
-    position_ids = torch.nested.nested_tensor(
-        [torch.tensor([0, 1, 2]), torch.tensor([0, 1])],
-        layout=torch.jagged,
-    )
-    micro_batch = TensorDict({}, batch_size=[])
+    input_ids = torch.nested.nested_tensor([torch.tensor([10, 11, 12]), torch.tensor([20, 21])], layout=torch.jagged)
+    position_ids = torch.nested.nested_tensor([torch.tensor([0, 1, 2]), torch.tensor([0, 1])], layout=torch.jagged)
 
     with mock.patch.dict(os.environ, {"VERL_TPU_SEQ_BUCKET_SIZE": "8"}):
-        _, _, _, attention_masks, orig_seq_len = pad_packed_inputs_for_tpu(
+        ids, pos, labels, orig_seq_len = pad_packed_inputs_for_tpu(
             input_ids=input_ids,
             position_ids=position_ids,
-            micro_batch=micro_batch,
+            micro_batch=TensorDict({}, batch_size=[]),
             device=torch.device("cpu"),
         )
-
     assert orig_seq_len == 5
-    assert attention_masks is not None
-    assert attention_masks.shape == (1, 1, 8, 8)
-    assert attention_masks.dtype == torch.bool
-    # Document 0 (tokens 0..2) attends causally within [0..2] and not to document 1 (tokens 3..4)
-    assert attention_masks[0, 0, 2, 0].item() is True
-    assert attention_masks[0, 0, 0, 2].item() is False
-    assert attention_masks[0, 0, 3, 2].item() is False
-    assert attention_masks[0, 0, 4, 3].item() is True
-    # Padded tail (tokens 5..7) has self-attention only (no cross-token attention)
-    assert attention_masks[0, 0, 6, 6].item() is True
-    assert attention_masks[0, 0, 6, 5].item() is False
+    assert ids.tolist() == [10, 11, 12, 20, 21, 0, 0, 0]
+    # Pad tokens get position 0: each one is its own document for the attention.
+    assert pos.tolist() == [0, 1, 2, 0, 1, 0, 0, 0]
+    assert labels.tolist() == [11, 12, 20, 21, 10, 0, 0, 0]
 
-
-def test_pad_packed_inputs_for_tpu_skips_mask_and_honors_aligned_length():
-    input_ids = torch.nested.nested_tensor(
-        [torch.tensor([10, 11, 12]), torch.tensor([20, 21])],
-        layout=torch.jagged,
-    )
-    position_ids = torch.nested.nested_tensor(
-        [torch.tensor([0, 1, 2]), torch.tensor([0, 1])],
-        layout=torch.jagged,
-    )
+    # The common cross-rank length from align_micro_batch_shapes_across_ranks wins over the local bucket.
     micro_batch = TensorDict({}, batch_size=[])
     tu.assign_non_tensor_data(micro_batch, "tpu_padded_seq_len", 16)
-
     with mock.patch.dict(os.environ, {"VERL_TPU_SEQ_BUCKET_SIZE": "8"}):
-        padded_ids, padded_pos, padded_labels, attention_masks, orig_seq_len = pad_packed_inputs_for_tpu(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            micro_batch=micro_batch,
-            device=torch.device("cpu"),
-            build_attention_mask=False,
-        )
+        ids, pos, labels, _ = pad_packed_inputs_for_tpu(input_ids, position_ids, micro_batch, torch.device("cpu"))
+    assert ids.shape == pos.shape == labels.shape == (16,)
 
-    assert orig_seq_len == 5
-    assert attention_masks is None
-    assert padded_ids.shape == (1, 16)
-    assert padded_pos.shape == (1, 16)
-    assert padded_labels.shape == (1, 16)
+
+def test_tpu_varlen_attention_masks_documents_and_padding():
+    torch.manual_seed(0)
+    q, k, v = torch.randn(3, 8, 4, 16).unbind(0)  # [T=8, H=4, D=16], packed docs of lengths 3 and 2 + 3 pads
+    k, v = k[:, :2], v[:, :2]  # GQA: 2 kv heads
+    positions = torch.tensor([0, 1, 2, 0, 1, 0, 0, 0])
+    out = TPUVarlenAttention()(q, k, v, positions=positions)
+    assert out.shape == (8, 4, 16)
+
+    def reference(lo, hi):  # causal attention restricted to tokens [lo, hi)
+        qd, kd, vd = (t[lo:hi].transpose(0, 1) for t in (q, k.repeat_interleave(2, 1), v.repeat_interleave(2, 1)))
+        return torch.nn.functional.scaled_dot_product_attention(qd, kd, vd, is_causal=True).transpose(0, 1)
+
+    for lo, hi in [(0, 3), (3, 5), (5, 6), (6, 7), (7, 8)]:
+        torch.testing.assert_close(out[lo:hi], reference(lo, hi))
+    with pytest.raises(NotImplementedError, match="out_transform"):
+        TPUVarlenAttention()(q, k, v, positions=positions, out_transform=lambda o, lse: o)
 
 
 def test_splash_block_size_for():
@@ -130,14 +144,11 @@ def test_splash_block_size_for():
     assert splash_block_size_for(64) == 0
 
 
-def test_apply_splash_attention_tpu_and_cpu_fallback():
+def test_install_tpu_attention_splash_with_dense_cpu_fallback():
     class _DummyInnerAttn(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.window_size = (256, 0)
-
-        def forward(self, q, k, v, **kwargs):
-            return q + k + v
 
     class _DummyAttnBlock(torch.nn.Module):
         def __init__(self):
@@ -145,15 +156,20 @@ def test_apply_splash_attention_tpu_and_cpu_fallback():
             self.inner_attention = _DummyInnerAttn()
 
     model = torch.nn.Sequential(_DummyAttnBlock(), _DummyAttnBlock())
-    assert apply_splash_attention_tpu([model]) == 2
-    assert isinstance(model[0].inner_attention, TPUSplashAttention)
-    assert model[0].inner_attention.local_window_size == 256
-    # Idempotent on repeated calls (e.g. __init__ followed by initialize)
-    assert apply_splash_attention_tpu([model]) == 0
+    assert install_tpu_attention([model], use_splash=True) == 2
+    splash = model[0].inner_attention
+    assert isinstance(splash, TPUSplashAttention)
+    assert splash.local_window_size == 256
+    assert isinstance(splash.fallback, TPUVarlenAttention) and splash.fallback.local_window_size == 256
+    assert install_tpu_attention([model], use_splash=True) == 0  # already installed
 
-    q = torch.ones(1, 256, 2, 4)
-    out = model[0].inner_attention(q, q, q)
-    assert torch.allclose(out, q * 3)
+    # On CPU the splash module runs its dense fallback.
+    q = torch.randn(256, 2, 4)
+    positions = torch.cat([torch.arange(100), torch.arange(156)])
+    torch.testing.assert_close(splash(q, q, q, positions=positions), splash.fallback(q, q, q, positions=positions))
+
+    with pytest.raises(ValueError, match="inner_attention"):
+        install_tpu_attention([torch.nn.Linear(2, 2)], use_splash=True)
 
 
 def test_configure_torch_compile_for_tpu():
@@ -188,29 +204,39 @@ def test_resolve_tpu_torchtitan_options_and_config_extension():
     cfg_tp = SimpleNamespace(
         use_torch_compile=True,
         use_splash_attention=True,
-        use_simple_fsdp=True,
+        use_simple_fsdp=None,
         tpu_eager_mode="DEFER_AND_FUSE",
         tensor_parallel_size=2,
         pipeline_parallel_size=1,
         context_parallel_size=1,
         expert_parallel_size=1,
     )
-    with pytest.raises(ValueError, match="use_simple_fsdp supports pure FSDP/HSDP only"):
-        resolve_tpu_torchtitan_options(cfg_tp)
+    assert resolve_tpu_torchtitan_options(cfg_tp) == (True, True, "DEFER_AND_FUSE")
+
+    cfg_pp = SimpleNamespace(
+        use_torch_compile=True,
+        use_splash_attention=True,
+        use_simple_fsdp=True,
+        tpu_eager_mode="DEFER_AND_FUSE",
+        tensor_parallel_size=1,
+        pipeline_parallel_size=2,
+        context_parallel_size=1,
+        expert_parallel_size=1,
+    )
+    with pytest.raises(ValueError, match="use_simple_fsdp supports FSDP/HSDP"):
+        resolve_tpu_torchtitan_options(cfg_pp)
 
 
-def test_replace_varlen_attention_with_tpu_attention():
+def test_install_tpu_attention_dense():
     class _DummyAttnBlock(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.inner_attention = torch.nn.Identity()
 
     model = torch.nn.Sequential(_DummyAttnBlock(), _DummyAttnBlock())
-    assert replace_varlen_attention_with_tpu_attention([model]) == 2
-    assert isinstance(model[0].inner_attention, TPUVarlenAttention)
-    assert isinstance(model[1].inner_attention, TPUVarlenAttention)
-    # Idempotent when called a second time
-    assert replace_varlen_attention_with_tpu_attention([model]) == 0
+    assert install_tpu_attention([model], use_splash=False) == 2
+    assert all(isinstance(block.inner_attention, TPUVarlenAttention) for block in model)
+    assert install_tpu_attention([model], use_splash=False) == 0
 
 
 def test_resolve_tpu_topology_bounds_multi_host():
@@ -276,11 +302,36 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
         assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-0"
 
 
-def test_get_ray_init_kwargs_names_the_setup_hook_by_module_path():
-    hook = PlatformTPU().get_ray_init_kwargs()["runtime_env"]["worker_process_setup_hook"]
-    assert hook == "verl_hardware_plugin.accelerators.tpu.platform_tpu.patch_ray_worker"
-    module_name, _, func_name = hook.rpartition(".")
-    assert getattr(importlib.import_module(module_name), func_name) is patch_ray_worker
+def _clear_forwarded_tpu_env(monkeypatch):
+    """Unset the variables the platform forwards, so the test shell's own exports do not leak in."""
+    for name in list(os.environ):
+        if name in ("LIBTPU_INIT_ARGS", "XLA_FLAGS") or name.startswith(("VERL_TPU_", "VERL_RAIDEN_")):
+            monkeypatch.delenv(name)
+
+
+def test_get_ray_init_kwargs_pins_tpu_platform(monkeypatch):
+    _clear_forwarded_tpu_env(monkeypatch)
+    assert PlatformTPU().get_ray_init_kwargs() == {"runtime_env": {"env_vars": {"VERL_PLATFORM": "tpu"}}}
+
+
+def test_driver_tpu_env_is_forwarded_to_ray_workers(monkeypatch):
+    """The recipe's exports are set in the driver only; the platform names them in the job's runtime_env."""
+    _clear_forwarded_tpu_env(monkeypatch)
+    flags = "--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_bf16_emission_mode=PROMOTE_F32"
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", flags)
+    monkeypatch.setenv("XLA_FLAGS", "")  # empty: not forwarded, it would replace the workers' own value
+    monkeypatch.setenv("VERL_TPU_EAGER_MODE", "DEFER_AND_FUSE")
+    monkeypatch.setenv("VERL_RAIDEN_RELEASE_BUFFERS", "0")
+    monkeypatch.setenv("VERL_LOGGING_LEVEL", "DEBUG")  # not a TPU knob: not forwarded
+    env_vars = PlatformTPU().get_ray_init_kwargs()["runtime_env"]["env_vars"]
+    assert env_vars == {
+        "VERL_PLATFORM": "tpu",
+        "LIBTPU_INIT_ARGS": flags,
+        "VERL_TPU_EAGER_MODE": "DEFER_AND_FUSE",
+        "VERL_RAIDEN_RELEASE_BUFFERS": "0",
+    }
+    monkeypatch.setenv("XLA_FLAGS", "--xla_dump_to=/tmp/xla")
+    assert PlatformTPU().get_ray_init_kwargs()["runtime_env"]["env_vars"]["XLA_FLAGS"] == "--xla_dump_to=/tmp/xla"
 
 
 def test_get_tpu_seq_bucket_size_respects_pad_to_length_config():
@@ -295,28 +346,56 @@ def test_get_tpu_seq_bucket_size_respects_pad_to_length_config():
         assert get_tpu_seq_bucket_size(cfg_enabled) == 128
 
 
-def test_force_sum_reduction_on_all_fsdp_modules():
-    class _FakeFSDPLayer(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.set_force_sum_reduction_for_comms = mock.MagicMock()
+@mock.patch.dict(sys.modules, _fake_torchtitan_modules())
+def test_get_tpu_simple_fsdp_parallelize_fn_uses_torchtitan_tpu_recipe():
+    from torchtitan.experiments.graph_trainer import simple_fsdp
 
-    class _FakeFSDPRoot(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layer0 = _FakeFSDPLayer()
-            self.layer1 = _FakeFSDPLayer()
-            self.plain = torch.nn.Linear(2, 2)
-            self.set_force_sum_reduction_for_comms = mock.MagicMock()
+    calls = []
+    init_flags = []
 
-    assert force_sum_reduction_on_all_fsdp_modules(None) == 0
-    assert force_sum_reduction_on_all_fsdp_modules([torch.nn.Linear(2, 2)]) == 0
+    class _Model(torch.nn.Module):
+        def init_states(self, *, buffer_device=None):
+            init_flags.append(simple_fsdp._active_parametrization)
 
-    root = _FakeFSDPRoot()
-    assert force_sum_reduction_on_all_fsdp_modules([root]) == 3
-    root.set_force_sum_reduction_for_comms.assert_called_once_with(True)
-    root.layer0.set_force_sum_reduction_for_comms.assert_called_once_with(True)
-    root.layer1.set_force_sum_reduction_for_comms.assert_called_once_with(True)
+    def _recipe(model, **kwargs):
+        calls.append(kwargs)
+        return model
+
+    fake_recipe_module = SimpleNamespace(parallelize_qwen3=_recipe)
+    with mock.patch("importlib.import_module", return_value=fake_recipe_module) as import_module:
+        parallelize_fn = get_tpu_simple_fsdp_parallelize_fn("qwen3")
+    import_module.assert_called_once_with("torchtitan.experiments.tpu.qwen3.infra.parallelize")
+
+    model = parallelize_fn(_Model(), parallel_dims="pd", parallelism="cfg", skip_dp=False)
+    assert calls == [{"parallel_dims": "pd", "parallelism": "cfg", "skip_dp": False}]
+    # torchtitan's Trainer initializes after parallelizing: init must see SimpleFSDP's parametrization disabled.
+    model.init_states(buffer_device=None)
+    assert init_flags == [False]
+    assert simple_fsdp._active_parametrization is True
+
+    with pytest.raises(ValueError, match="use_simple_fsdp=True needs a torchtitan TPU recipe"):
+        get_tpu_simple_fsdp_parallelize_fn("deepseek_v3")
+
+
+@mock.patch.dict(sys.modules, _fake_torchtitan_modules())
+def test_init_states_without_simple_fsdp_parametrization_is_reentrant():
+    from torchtitan.experiments.graph_trainer import simple_fsdp
+
+    flags = []
+
+    class _Model(torch.nn.Module):
+        def init_states(self, *, buffer_device=None):
+            flags.append(simple_fsdp._active_parametrization)
+
+    model = _Model()
+    init_states_without_simple_fsdp_parametrization(model)
+    model.init_states(buffer_device=None)
+    # A caller that already disabled the parametrization keeps it disabled after init returns.
+    with simple_fsdp.disable_active_parametrization():
+        model.init_states(buffer_device=None)
+        flags.append(simple_fsdp._active_parametrization)
+    assert flags == [False, False, False]
+    assert simple_fsdp._active_parametrization is True
 
 
 def test_prepare_tpu_loss_inputs_matches_unmodified_sft_loss():
@@ -472,3 +551,334 @@ def test_prepare_tpu_loss_inputs_ppo_falls_back_to_trimmed_outputs():
     loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, _ppo_micro_batch(lengths, 16))
     assert loss_model_output["log_probs"].values().shape == torch.Size([int(cu_seqlens[-1])])
     assert loss_data["responses"].offsets().diff().tolist() == [2, 5]
+
+
+def _imported_modules(nodes) -> set[str]:
+    names = set()
+    for node in nodes:
+        if isinstance(node, ast.ImportFrom):
+            names.add(node.module or "")
+        elif isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+    return names
+
+
+def test_standalone_torchtitan_tpu_engine_decoupled_from_core_torchtitan():
+    """TorchTitanTPUEngine subclasses BaseEngine directly without importing verl.workers.engine.torchtitan."""
+    from torch.distributed.fsdp import FSDPModule
+
+    from verl.workers.engine.base import BaseEngine
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu, tpu_utils
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+        derive_torchtitan_name_and_flavor,
+        enable_fsdp_gradient_division,
+    )
+
+    assert issubclass(torchtitan_tpu.TorchTitanTPUEngine, BaseEngine)
+    assert issubclass(torchtitan_tpu.TorchTitanTPUEngineWithLMHead, torchtitan_tpu.TorchTitanTPUEngine)
+
+    # Nothing in the engine imports core verl's GPU TorchTitan engine, and torchtitan is only imported inside
+    # functions, so the plugin registers on machines without torchtitan.
+    for module in (torchtitan_tpu, tpu_utils):
+        tree = ast.parse(open(module.__file__).read())
+        assert not any(n.startswith("verl.workers.engine.torchtitan") for n in _imported_modules(ast.walk(tree)))
+        assert not any(n.startswith("torchtitan") for n in _imported_modules(tree.body))
+
+    hf_cfg = SimpleNamespace(
+        model_type="qwen3",
+        hidden_size=1024,
+        num_hidden_layers=28,
+        vocab_size=151936,
+    )
+    fake_cfg = SimpleNamespace(dim=1024, n_layers=28, vocab_size=151936)
+    fake_qwen3 = SimpleNamespace(
+        model_registry=lambda flavor_name: SimpleNamespace(model=fake_cfg),
+        qwen3_configs={"0.6B": fake_cfg},
+    )
+    with mock.patch("importlib.import_module", return_value=fake_qwen3):
+        assert derive_torchtitan_name_and_flavor(hf_cfg) == ("qwen3", "0.6B")
+
+    fsdp_child = mock.MagicMock(spec=FSDPModule)
+    root = SimpleNamespace(modules=lambda: [torch.nn.Linear(2, 2), fsdp_child])
+    enable_fsdp_gradient_division(root, 4)
+    fsdp_child.set_gradient_divide_factor.assert_called_once_with(4.0)
+
+
+def test_fused_linear_cross_entropy_tpu_and_logprobs():
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
+        fused_linear_logprobs_tpu,
+        resolve_tpu_use_fused_linear_cross_entropy,
+    )
+
+    class _FakeFusedLossLinearWrapper(torch.nn.Linear):
+        def forward(self, x: torch.Tensor):
+            return x, self.weight.t()
+
+    seen_calls = []
+
+    def _fake_kernel(hidden_2d, labels_1d, weight_hv, *, reduction="sum", **kwargs):
+        seen_calls.append((hidden_2d.shape, labels_1d.shape, weight_hv.shape, reduction))
+        return torch.full((hidden_2d.shape[0],), 0.5, dtype=torch.float32)
+
+    fake_loss_mod = types.ModuleType("torchtitan.experiments.tpu.kernels.linear_softmax_cross_entropy_loss")
+    fake_loss_mod.linear_softmax_cross_entropy_loss = _fake_kernel
+    fake_loss_mod._verl_reduction_none_patched = True
+    fake_sys_modules = {
+        "torchtitan": types.ModuleType("torchtitan"),
+        "torchtitan.experiments": types.ModuleType("torchtitan.experiments"),
+        "torchtitan.experiments.tpu": types.ModuleType("torchtitan.experiments.tpu"),
+        "torchtitan.experiments.tpu.kernels": types.ModuleType("torchtitan.experiments.tpu.kernels"),
+        "torchtitan.experiments.tpu.kernels.linear_softmax_cross_entropy_loss": fake_loss_mod,
+    }
+    fake_sys_modules["torchtitan"].experiments = fake_sys_modules["torchtitan.experiments"]  # type: ignore[attr-defined]
+    fake_sys_modules["torchtitan.experiments"].tpu = fake_sys_modules["torchtitan.experiments.tpu"]  # type: ignore[attr-defined]
+    fake_sys_modules["torchtitan.experiments.tpu"].kernels = fake_sys_modules["torchtitan.experiments.tpu.kernels"]  # type: ignore[attr-defined]
+    fake_sys_modules["torchtitan.experiments.tpu"].kernels.linear_softmax_cross_entropy_loss = fake_loss_mod  # type: ignore[attr-defined]
+
+    with mock.patch.dict(sys.modules, fake_sys_modules):
+        lm_head = _FakeFusedLossLinearWrapper(16, 32, bias=False)
+        x = torch.randn(2, 5, 16)
+        out_fused = lm_head(x)
+        assert isinstance(out_fused, tuple) and len(out_fused) == 2
+        assert out_fused[0] is x
+        assert out_fused[1].shape == (16, 32)
+        assert (
+            resolve_tpu_use_fused_linear_cross_entropy(
+                SimpleNamespace(use_fused_linear_cross_entropy=None, use_torch_compile=True)
+            )
+            is True
+        )
+        assert (
+            resolve_tpu_use_fused_linear_cross_entropy(
+                SimpleNamespace(use_fused_linear_cross_entropy=False, use_torch_compile=True)
+            )
+            is False
+        )
+        labels = torch.randint(0, 32, (2, 5))
+        logprobs = fused_linear_logprobs_tpu(out_fused[0], labels, out_fused[1])
+        assert logprobs.shape == (10,)
+        assert torch.allclose(logprobs, torch.full((10,), -0.5))
+        # Kernel receives B padded to a multiple of 1024 with reduction="none"
+        assert seen_calls == [(torch.Size([1024, 16]), torch.Size([1024]), torch.Size([16, 32]), "none")]
+
+
+@pytest.mark.parametrize("calculate_entropy", [False, True])
+def test_prepare_model_outputs_takes_log_probs_from_the_fused_kernel_on_every_pass(calculate_entropy):
+    """With the fused LM head, log-probs come from the fused kernel also when entropy is requested.
+
+    The reference, old-log-prob (entropy) and update passes then compute log-probs the same way, so an on-policy
+    PPO ratio is exactly 1. Entropy is taken from the logits in fp32, as on GPU.
+    """
+    import verl.utils.torch_functional as verl_F
+    from verl_hardware_plugin.accelerators.tpu.engines import torchtitan_tpu
+
+    seq_lens, hidden_dim, vocab = [3, 5], 4, 6
+    total = sum(seq_lens)
+    hidden = torch.randn(1, total, hidden_dim)
+    weight_t = torch.randn(hidden_dim, vocab)
+    labels = torch.randint(0, vocab, (1, total))
+    fused_values = torch.full((total,), -0.25)
+
+    engine = object.__new__(torchtitan_tpu.TorchTitanTPUEngineWithLMHead)
+    engine.parallel_dims = SimpleNamespace(tp_enabled=False)
+    engine.engine_config = SimpleNamespace(entropy_checkpointing=False, entropy_from_logits_with_chunking=False)
+    engine.compute_entropy_from_logits = verl_F.entropy_from_logits
+
+    micro_batch = TensorDict(
+        {
+            "input_ids": torch.nested.as_nested_tensor(
+                [torch.zeros(n, dtype=torch.int64) for n in seq_lens], layout=torch.jagged
+            )
+        },
+        batch_size=[len(seq_lens)],
+    )
+    tu.assign_non_tensor(micro_batch, use_remove_padding=True, calculate_entropy=calculate_entropy, temperature=1.0)
+
+    with mock.patch.object(torchtitan_tpu, "fused_linear_logprobs_tpu", return_value=fused_values) as fused:
+        output = engine.prepare_model_outputs((hidden, weight_t), {"labels": labels}, micro_batch)
+
+    fused.assert_called_once()
+    torch.testing.assert_close(output["log_probs"].values(), fused_values)
+    if calculate_entropy:
+        expected_entropy = verl_F.entropy_from_logits((hidden.squeeze(0) @ weight_t).float())
+        torch.testing.assert_close(output["entropy"].values(), expected_entropy)
+    else:
+        assert "entropy" not in output
+
+
+def test_offload_and_reload_tpu_model_reuses_cached_cpu_copy_for_frozen_models(tmp_path):
+    import torch.distributed as dist
+    from torch.distributed.tensor import DTensor, Shard, init_device_mesh
+
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import move_tpu_params_
+
+    owns_group = not dist.is_initialized()
+    if owns_group:
+        dist.init_process_group("gloo", init_method=f"file://{tmp_path}/pg", rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        model = torch.nn.Linear(4, 3, bias=False)
+        local = model.weight.detach().clone()
+        model.weight = torch.nn.Parameter(DTensor.from_local(local, mesh, [Shard(0)]), requires_grad=False)
+        weight = model.weight
+
+        # First offload of a frozen model caches the host shard on the parameter.
+        move_tpu_params_(model, "cpu", cache_cpu_copy=True)
+        cached = weight._tpu_cpu_offload_tensor
+        assert weight._local_tensor is cached
+
+        # "meta" stands in for the TPU: the reload swaps the local shard in place, keeping the DTensor and its mesh.
+        move_tpu_params_(model, "meta")
+        assert model.weight is weight
+        assert weight._local_tensor.device.type == "meta"
+        assert weight.device_mesh is mesh
+
+        # Offloading again reuses the cached host shard (a device-to-host copy from "meta" would raise).
+        move_tpu_params_(model, "cpu", cache_cpu_copy=True)
+        assert weight._local_tensor is cached
+        assert torch.equal(weight._local_tensor, local)
+    finally:
+        if owns_group:
+            dist.destroy_process_group()
+
+
+def test_compute_tpu_logprobs_chunked_matches_naive_and_propagates_grad():
+    from verl.utils.torch_functional import logprobs_from_logits_naive
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import compute_tpu_logprobs_chunked
+
+    torch.manual_seed(0)
+    logits_ref = torch.randn(1, 20, 32, dtype=torch.bfloat16, requires_grad=True)
+    logits_chk = logits_ref.detach().clone().requires_grad_(True)
+    labels = torch.randint(0, 32, (20,), dtype=torch.int64)
+
+    lp_ref = logprobs_from_logits_naive((logits_ref.squeeze(0) / 1.25).float(), labels)
+    lp_chk = compute_tpu_logprobs_chunked(logits_chk, labels, temperature=1.25, chunk_size=7)
+
+    assert torch.allclose(lp_ref, lp_chk, atol=1e-3, rtol=1e-3)
+    grad_out = torch.randn_like(lp_ref)
+    lp_ref.backward(grad_out)
+    lp_chk.backward(grad_out)
+    assert logits_ref.grad is not None and logits_chk.grad is not None
+    assert torch.allclose(logits_ref.grad, logits_chk.grad, atol=1e-3, rtol=1e-3)
+
+
+def test_install_parallel_dims_cache_for_tpu_reuses_parallel_dims_and_mesh():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    build_calls = []
+
+    class _FakeParallelDims:
+        def __init__(self, cfg, ws):
+            self.cfg = cfg
+            self.ws = ws
+            self._world_mesh = None
+            self._single_axis_meshes = None
+
+        @classmethod
+        def from_config(cls, cfg, ws):
+            return cls(cfg, ws)
+
+        def build_mesh(self):
+            build_calls.append(1)
+            self._world_mesh = object()
+            self._single_axis_meshes = {"tp": object()}
+            return self._world_mesh
+
+    fake_pd_mod = types.ModuleType("torchtitan.distributed.parallel_dims")
+    fake_pd_mod.ParallelDims = _FakeParallelDims  # type: ignore[attr-defined]
+    fake_dist_mod = types.ModuleType("torchtitan.distributed")
+    fake_dist_mod.parallel_dims = fake_pd_mod  # type: ignore[attr-defined]
+
+    with (
+        mock.patch.dict(
+            sys.modules,
+            {
+                "torchtitan.distributed": fake_dist_mod,
+                "torchtitan.distributed.parallel_dims": fake_pd_mod,
+            },
+        ),
+        mock.patch.object(tpu_utils, "_PARALLEL_DIMS_PATCHED", False),
+        mock.patch.object(tpu_utils, "_PARALLEL_DIMS_CACHE", {}),
+    ):
+        tpu_utils.install_parallel_dims_cache_for_tpu()
+        cfg1 = SimpleNamespace(
+            data_parallel_replicate_degree=1,
+            data_parallel_shard_degree=2,
+            context_parallel_degree=1,
+            tensor_parallel_degree=2,
+            pipeline_parallel_degree=1,
+            expert_parallel_degree=1,
+            spmd_backend="spmd_types",
+            enable_tpu_topo_mesh=False,
+        )
+        cfg2 = SimpleNamespace(**vars(cfg1))
+        pd1 = _FakeParallelDims.from_config(cfg1, 4)
+        pd2 = _FakeParallelDims.from_config(cfg2, 4)
+        assert pd1 is pd2
+        m1 = pd1.build_mesh()
+        m2 = pd2.build_mesh()
+        assert m1 is m2
+        assert len(build_calls) == 1
+
+
+def test_install_sync_dtensor_redistribute_for_tpu_forces_sync_only_in_eager():
+    import torch.distributed.tensor._api as dt_api
+    import torch.distributed.tensor._dispatch as dt_disp
+    import torch.distributed.tensor._redistribute as redist_mod
+
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    seen = []
+
+    def _fake_rlt(local_tensor, current_spec, target_spec, *, async_op=False, **kwargs):
+        seen.append(async_op)
+        return local_tensor
+
+    with (
+        mock.patch.object(redist_mod, "redistribute_local_tensor", _fake_rlt),
+        mock.patch.object(dt_api, "redistribute_local_tensor", _fake_rlt),
+        mock.patch.object(dt_disp, "redistribute_local_tensor", _fake_rlt),
+        mock.patch.object(tpu_utils, "_SYNC_DTENSOR_REDISTRIBUTE_PATCHED", False),
+    ):
+        tpu_utils.install_sync_dtensor_redistribute_for_tpu()
+        x = torch.ones(2, 2)
+        with mock.patch("torch.compiler.is_compiling", return_value=False):
+            redist_mod.redistribute_local_tensor(x, None, None, async_op=True)
+        with mock.patch("torch.compiler.is_compiling", return_value=True):
+            redist_mod.redistribute_local_tensor(x, None, None, async_op=True)
+        assert seen == [False, True]
+
+
+def test_build_dp_gloo_group_creates_host_gloo_subgroups_when_tp_enabled():
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    engine = object.__new__(TorchTitanTPUEngine)
+    engine.engine_config = SimpleNamespace(
+        data_parallel_shard_size=2,
+        data_parallel_replicate_size=1,
+    )
+    engine.parallel_dims = SimpleNamespace(
+        pp=1,
+        cp=1,
+        tp=2,
+        _global_meshes={"dataloading": SimpleNamespace(mesh=torch.tensor([[0, 1], [2, 3]]))},
+    )
+    created_groups = []
+
+    def _fake_new_group(ranks=None, backend=None):
+        pg = f"gloo_pg_{tuple(ranks)}"
+        created_groups.append((list(ranks), backend, pg))
+        return pg
+
+    with (
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch("torch.distributed.get_world_size", return_value=4),
+        mock.patch("torch.distributed.get_backend", return_value="cpu:gloo,tpu:tpu_dist"),
+        mock.patch("torch.distributed.get_rank", return_value=2),
+        mock.patch("torch.distributed.new_group", side_effect=_fake_new_group),
+    ):
+        my_pg = engine._build_dp_gloo_group()
+        assert my_pg == "gloo_pg_(0, 2)"
+        assert [(r, b) for r, b, _ in created_groups] == [([0, 2], "gloo"), ([1, 3], "gloo")]
+        assert engine._build_dp_gloo_group() == "gloo_pg_(0, 2)"
+        assert len(created_groups) == 2

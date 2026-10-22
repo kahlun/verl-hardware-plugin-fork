@@ -23,6 +23,7 @@ import torch
 
 from verl.plugin.platform.platform_base import PlatformBase
 from verl.plugin.platform.platform_manager import PlatformRegistry
+from verl_hardware_plugin.accelerators.tpu import device_api as tpu_device_api
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import extend_torchtitan_engine_config
 from verl_hardware_plugin.accelerators.tpu.patches import reduce_avg_allreduce_patch
 
@@ -48,6 +49,13 @@ def _ensure_torch_tpu() -> bool:
 
 
 _ensure_torch_tpu()  # Attempt at module load time so availability checks are faster later
+
+# Environment variables a recipe exports in the shell that runs the driver and that TPU worker processes
+# read: the libtpu / XLA compiler flags, and the plugin's own knobs (``VERL_TPU_*``, ``VERL_RAIDEN_*``). Ray
+# workers start from the raylet's environment, not the driver's, so the platform names them in the job's
+# runtime_env for them to reach the trainer workers, the rollout servers and vLLM's engine workers.
+TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS")
+TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_", "VERL_RAIDEN_")
 
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
@@ -222,6 +230,10 @@ class TPUDeviceModuleProxy:
             return lambda *args, **kwargs: 0
         elif name == "reset_peak_memory_stats":
             return lambda *args, **kwargs: None
+        elif name == "memory_stats":
+            return lambda *args, **kwargs: {}
+        elif name == "get_device_name":
+            return lambda *args, **kwargs: "Google TPU"
         elif name == "get_device_properties":
 
             class DummyDeviceProperties:
@@ -248,41 +260,48 @@ class TPUDeviceModuleProxy:
             setattr(self._original_module, name, value)
 
     def is_available(self) -> bool:
-        if hasattr(self._original_module, "is_available"):
-            try:
-                return self._original_module.is_available()
-            except Exception as e:
-                logger.warning(f"torch.tpu.is_available() check failed: {e}")
-                return False
-        return False
+        return tpu_device_api.is_available()
 
     def set_device(self, device_index: Any) -> None:
         pass
 
     def current_device(self) -> int:
-        if hasattr(self._original_module, "current_device"):
-            try:
-                return self._original_module.current_device()
-            except Exception as e:
-                logger.warning(f"torch.tpu.current_device() failed: {e}")
-                return 0
-        return 0
+        try:
+            return tpu_device_api.current_device()
+        except Exception as e:
+            logger.warning(f"TPU current_device() failed: {e}")
+            return 0
 
     def device_count(self) -> int:
-        if hasattr(self._original_module, "device_count"):
-            try:
-                return self._original_module.device_count()
-            except Exception as e:
-                logger.warning(f"torch.tpu.device_count() failed: {e}")
-                return 0
-        return 0
+        try:
+            return tpu_device_api.device_count()
+        except Exception as e:
+            logger.warning(f"TPU device_count() failed: {e}")
+            return 0
 
     def synchronize(self, device_index: Optional[int] = None) -> None:
-        if hasattr(self._original_module, "synchronize"):
-            try:
-                self._original_module.synchronize()
-            except Exception as e:
-                logger.warning(f"torch.tpu.synchronize() failed: {e}")
+        try:
+            tpu_device_api.synchronize()
+        except Exception as e:
+            logger.warning(f"TPU synchronize() failed: {e}")
+
+    # torch_tpu >= 0.2.0 makes these torch.tpu functions internal (they raise when called from
+    # outside torch / torch_tpu), so they are served through torch.accelerator instead of being
+    # forwarded to torch.tpu by __getattr__.
+    def current_stream(self, device: Any = None):
+        return tpu_device_api.current_stream(device)
+
+    def set_stream(self, stream: Any) -> None:
+        tpu_device_api.set_stream(stream)
+
+    def device(self, device_index: Any):
+        return tpu_device_api.device(device_index)
+
+    def get_rng_state(self, device: Any = None) -> torch.Tensor:
+        return tpu_device_api.get_rng_state(device)
+
+    def initial_seed(self) -> int:
+        return tpu_device_api.initial_seed()
 
     def manual_seed_all(self, seed: int) -> None:
         # torch_tpu does not always expose manual_seed_all; the global torch seed is the
@@ -301,33 +320,13 @@ class TPUDeviceModuleProxy:
                 logger.warning(f"Failed to clear TPU cache: {e}")
 
 
-def patch_ray_worker() -> None:
-    """Ray ``worker_process_setup_hook`` for GKE TPU pods.
-
-    Runs once in every Ray worker process before any task. It does two things:
-
-    1. Pins ``VERL_PLATFORM=tpu`` so a worker that did not inherit the driver's environment still
-       resolves the TPU platform.
-    2. Makes Raylet's accelerator-id lookup non-fatal. Each GKE pod is given only its own slice of
-       the host's TPU chips, so a host-level index lookup can run off the end of the visible list
-       and raise ``IndexError``. Returning an empty list is correct here: verl assigns chips itself
-       via ``TPU_VISIBLE_CHIPS``.
-    """
-    os.environ["VERL_PLATFORM"] = "tpu"
-
-    try:
-        original_func = ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource
-
-        def patched_func(self, resource_name, resource_regex):
-            try:
-                return original_func(self, resource_name, resource_regex)
-            except IndexError as e:
-                logger.debug("Intercepted Ray accelerator lookup IndexError for resource %r: %s", resource_name, e)
-                return []
-
-        ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource = patched_func
-    except Exception as e:
-        logger.warning(f"Failed to apply Ray worker accelerator patch: {e}")
+def driver_tpu_env_for_workers() -> dict[str, str]:
+    """The forwarded variables (``TPU_FORWARDED_ENV_VARS`` and ``*_PREFIXES``) that are set and not empty."""
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if value and (name in TPU_FORWARDED_ENV_VARS or name.startswith(TPU_FORWARDED_ENV_PREFIXES))
+    }
 
 
 def configure_torchrun_tpu_env() -> None:
@@ -419,6 +418,16 @@ class PlatformTPU(PlatformBase):
         configure_torchrun_tpu_env()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         self._device_module = TPUDeviceModuleProxy(original_tpu)
+        if hasattr(torch, "tpu"):
+            for attr in (
+                "reset_peak_memory_stats",
+                "empty_cache",
+                "memory_stats",
+                "get_device_name",
+                "get_device_properties",
+            ):
+                if not hasattr(torch.tpu, attr):
+                    setattr(torch.tpu, attr, getattr(self._device_module, attr))
         self._claimed_slices: set[str] = set()
 
     @property
@@ -468,10 +477,7 @@ class PlatformTPU(PlatformBase):
 
     def is_available(self) -> bool:
         if hasattr(torch, "tpu"):
-            try:
-                return torch.tpu.is_available()
-            except Exception as e:
-                logger.warning(f"torch.tpu.is_available() check failed: {e}")
+            return tpu_device_api.is_available()
         return False
 
     def is_platform_available(self, use_smi_check=False) -> bool:
@@ -497,8 +503,7 @@ class PlatformTPU(PlatformBase):
     def visible_devices_envvar(self) -> str:
         # Deliberately CUDA_VISIBLE_DEVICES, not TPU_VISIBLE_CHIPS. verl assigns
         # os.environ[this key] when launching vLLM servers; pointing it at
-        # TPU_VISIBLE_CHIPS would overwrite the chip index that get_worker_env_vars()
-        # writes and ray_local_rank_override() reads. Changing this breaks rank mapping.
+        # TPU_VISIBLE_CHIPS would overwrite the chip index managed by Ray.
         return "CUDA_VISIBLE_DEVICES"
 
     def is_ipc_supported(self) -> bool:
@@ -523,34 +528,30 @@ class PlatformTPU(PlatformBase):
         pass
 
     def ray_noset_envvars(self) -> list[str]:
-        # CUDA_VISIBLE_DEVICES is listed because visible_devices_envvar() deliberately returns
-        # it (see above), so Ray must be told not to manage that variable either.
-        return [
-            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
-            "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
-        ]
-
-    def ray_local_rank_override(self) -> Optional[str]:
-        # Ray does not enumerate TPU chips, so the index comes from TPU_VISIBLE_CHIPS, which
-        # get_worker_env_vars() sets when the worker is created.
-        return os.environ.get("TPU_VISIBLE_CHIPS", "0")
+        return []
 
     def supports_colocated_worker_groups(self) -> bool:
         # A TPU chip belongs to one process and cannot be shared between colocated WorkerGroups.
         return False
 
     def get_ray_init_kwargs(self) -> dict[str, Any]:
-        """Install the GKE TPU worker setup hook and pin the platform inside Ray workers.
+        """Pin the TPU platform inside Ray workers and forward the driver's TPU environment to them.
 
-        The hook is passed as a module path rather than the function. Ray exports a function under
-        a generated key and keeps only the function's name in the job's runtime env. vLLM's
-        EngineCore calls ``ray.init`` again with the runtime env it captured from the server actor,
-        and Ray rejects that name as conflicting with the key. A module path round-trips unchanged.
+        ``LIBTPU_INIT_ARGS``, ``XLA_FLAGS`` and the ``VERL_TPU_*`` / ``VERL_RAIDEN_*`` knobs that a recipe
+        exports are set in the driver process only; a Ray worker inherits the raylet's environment. Naming
+        them in the job-level ``runtime_env`` delivers them to every actor of the job, including actors
+        created with a ``runtime_env`` of their own: Ray merges ``env_vars`` per key between a child and its
+        parent (``ray.runtime_env._merge_runtime_env``), so the rollout servers and vLLM's engine workers get
+        them as well as the trainer workers. ``main_ppo`` applies this ``runtime_env`` through ``ray.init``,
+        which under ``ray job submit`` needs ``RAY_OVERRIDE_JOB_RUNTIME_ENV=1`` (the recipes set it).
+
+        A forwarded value replaces the one in a worker's own environment, so a flag meant for every process
+        goes in the recipe, not in the pod spec. Variables that are unset or empty in the driver's
+        environment are not forwarded and the workers keep their own.
         """
         return {
             "runtime_env": {
-                "worker_process_setup_hook": f"{patch_ray_worker.__module__}.{patch_ray_worker.__qualname__}",
-                "env_vars": {"VERL_PLATFORM": "tpu"},
+                "env_vars": {"VERL_PLATFORM": "tpu", **driver_tpu_env_for_workers()},
             }
         }
 
@@ -653,7 +654,8 @@ class PlatformTPU(PlatformBase):
             "TPU_PROCESS_PORT": str(base_port + local_rank),
             "CLOUD_TPU_TASK_ID": str(rank // local_world_size),
             "TPU_WORKER_HOSTNAMES": ",".join(unique_hostnames),
-            "TPU_VISIBLE_CHIPS": str(local_rank),
+            "LOCAL_RANK": str(local_rank),
+            "LOCAL_WORLD_SIZE": str(local_world_size),
         }
 
         # Derive the mesh from the pod type Ray reports, falling back to the chip count.

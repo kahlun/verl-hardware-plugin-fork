@@ -75,22 +75,10 @@ def _stub_training_engine_runtimes():
     megatron_transformer.MegatronEngineWithLMHead = _StubEngine
     megatron_transformer.MegatronEngineWithValueHead = _StubEngine
 
-    torchtitan_transformer = ModuleType("verl.workers.engine.torchtitan.transformer_impl")
-    torchtitan_transformer.TorchTitanEngine = _StubEngine
-    torchtitan_transformer.TorchTitanEngineWithLMHead = _StubEngine
-
-    torchtitan_utils = ModuleType("verl.workers.engine.torchtitan.utils")
-    torchtitan_utils.NoOpDataLoader = mock.MagicMock()
-    torchtitan_utils.derive_torchtitan_name_and_flavor = mock.MagicMock()
-    torchtitan_utils.enable_fsdp_gradient_division = mock.MagicMock()
-    torchtitan_utils.get_attention_masks = mock.MagicMock()
-
     engine_modules = {
         "verl.workers.engine.fsdp": fsdp,
         "verl.workers.engine.fsdp.transformer_impl": fsdp_transformer,
         "verl.workers.engine.megatron.transformer_impl": megatron_transformer,
-        "verl.workers.engine.torchtitan.transformer_impl": torchtitan_transformer,
-        "verl.workers.engine.torchtitan.utils": torchtitan_utils,
     }
     with (
         mock.patch.dict(os.environ, {"VERL_USE_EXTERNAL_PLUGINS": "none"}),
@@ -286,18 +274,12 @@ class TestPlatformRegistration:
         assert platform.ray_resource_options(0) == {}
 
     def test_tpu_core_hooks(self):
-        """The three PlatformBase hooks TPU needs from verl core.
-
-        Inert on verl 0.9.0 -- nothing calls them yet. They are defined
-        unconditionally so the plugin needs no change when core lands the call sites.
-        """
+        """The PlatformBase hooks TPU defines for verl core."""
         from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         platform = PlatformTPU()
         assert platform.supports_colocated_worker_groups() is False
-        assert "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS" in platform.ray_noset_envvars()
-        with mock.patch.dict(os.environ, {"TPU_VISIBLE_CHIPS": "3"}):
-            assert platform.ray_local_rank_override() == "3"
+        assert platform.ray_noset_envvars() == []
 
     def test_tpu_derives_from_platform_base(self):
         """PlatformTPU must not acquire another vendor's platform behaviour by inheritance.
@@ -336,17 +318,10 @@ class TestPlatformRegistration:
         assert platform.get_device_capability() == (None, None)
 
     def test_tpu_ray_noset_envvars(self):
-        """Both entries are load-bearing, including the CUDA one.
-
-        visible_devices_envvar() deliberately returns CUDA_VISIBLE_DEVICES, so Ray must be
-        told not to manage that variable either. Dropping it breaks rank mapping.
-        """
+        """Ray 2.59.0+ natively enumerates and assigns TPU_VISIBLE_CHIPS per actor."""
         from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
-        assert PlatformTPU().ray_noset_envvars() == [
-            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
-            "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
-        ]
+        assert PlatformTPU().ray_noset_envvars() == []
 
     def test_tpu_ipc_unsupported(self):
         """TPU has no CUDA-style IPC handle, so verl must fall back to shared memory.
@@ -363,8 +338,7 @@ class TestPlatformRegistration:
         """Intentional, not an oversight: TPU keeps CUDA_VISIBLE_DEVICES.
 
         Returning TPU_VISIBLE_CHIPS here would let vllm_async_server overwrite the
-        chip index that get_worker_env_vars() writes and ray_local_rank_override()
-        reads. See spec D4.
+        chip index managed by Ray.
         """
         from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
@@ -409,7 +383,7 @@ class TestPlatformRegistration:
         assert head == on_slice_host
         assert head["TPU_WORKER_HOSTNAMES"] == "10.0.0.1,10.0.0.2"
         assert len(head["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
-        assert head["CLOUD_TPU_TASK_ID"] == "1" and head["TPU_VISIBLE_CHIPS"] == "1"
+        assert head["CLOUD_TPU_TASK_ID"] == "1" and head["LOCAL_RANK"] == "1" and "TPU_VISIBLE_CHIPS" not in head
 
     def test_tpu_cudart_returns_none(self):
         """There is no CUDA runtime on a TPU host; PlatformBase documents None as the answer."""
@@ -783,13 +757,69 @@ class TestXPURayDeviceIndex:
     """PlatformXPU pins Ray's physical device id, ignoring ZE_AFFINITY_MASK."""
 
     def test_returns_physical_id_even_when_masked(self):
-        from verl_hardware_plugin.platforms.platform_xpu import PlatformXPU
+        from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU
 
         platform = PlatformXPU.__new__(PlatformXPU)
         with mock.patch.dict(os.environ, {"ZE_AFFINITY_MASK": "2"}):
             assert platform.ray_device_index(["2"]) == 2
         with mock.patch.dict(os.environ, {}, clear=True):
             assert platform.ray_device_index(["3"]) == 3
+
+
+class TestXPUCollectiveModule:
+    """get_collective_module() must return the cupy.cuda.nccl-shaped XCCL shim.
+
+    verl.utils.rendezvous.ray_backend.create_nccl_communicator_in_ray() calls
+    collective.get_unique_id() and collective.NcclCommunicator(ndev, commId, rank)
+    on whatever get_collective_module() returns; it has no XPU-specific code of
+    its own, so the shim's shape is the entire contract.
+    """
+
+    def test_returns_module_with_nccl_shaped_api(self):
+        from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU
+
+        platform = PlatformXPU.__new__(PlatformXPU)
+        module = platform.get_collective_module()
+
+        assert callable(module.get_unique_id)
+        assert callable(module.NcclCommunicator)
+
+    def test_get_unique_id_returns_a_free_port_not_a_byte_blob(self):
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
+
+        with mock.patch("ray.util.get_node_ip_address", return_value="127.0.0.1"):
+            host, port = xccl_collective_xpu.get_unique_id()
+
+        assert host == "127.0.0.1"
+        assert isinstance(port, int) and port > 0
+
+    def test_constructor_calls_init_process_group_with_hybrid_backend(self):
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
+
+        with mock.patch("torch.distributed.init_process_group") as fake_init:
+            xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
+
+        fake_init.assert_called_once_with(
+            backend="cpu:gloo,xpu:xccl",
+            init_method="tcp://10.0.0.5:12345",
+            rank=1,
+            world_size=2,
+        )
+
+    def test_rank_id_reports_constructor_rank(self):
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
+
+        with mock.patch("torch.distributed.init_process_group"):
+            comm = xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
+
+        assert comm.rank_id() == 1
+
+    def test_pg_property_is_the_default_world_group(self):
+        from verl_hardware_plugin.accelerators.xpu import xccl_collective_xpu
+
+        with mock.patch("torch.distributed.init_process_group"), mock.patch("torch.distributed.group") as fake_group:
+            comm = xccl_collective_xpu.NcclCommunicator(ndev=2, commId=("10.0.0.5", 12345), rank=1)
+            assert comm._pg is fake_group.WORLD
 
 
 class TestReduceAvgPatchWiring:
@@ -809,10 +839,26 @@ class TestReduceAvgPatchWiring:
     def test_platform_xpu_init_applies_patches(self):
         from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU
 
-        with mock.patch("verl_hardware_plugin.accelerators.xpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply:
+        # Every entry PlatformXPU.__init__'s _PATCHES loop applies must be
+        # mocked here, not just reduce_avg's. ray_device_pin_patch.apply() is
+        # a real, permanent class-level monkeypatch of core's Worker with no
+        # cleanup outside tests -- unmocked, this call would leak a patched
+        # Worker._setup_env_cuda_visible_devices into every test that runs
+        # later in the same process, independent of which platform that
+        # process actually selected. register_vtune.apply() similarly leaks a
+        # permanent DistProfiler.__init__ patch if left unmocked.
+        with (
+            mock.patch("verl_hardware_plugin.accelerators.xpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply,
+            mock.patch("verl_hardware_plugin.accelerators.xpu.patches.ray_device_pin_patch.apply") as fake_pin_apply,
+            mock.patch("verl_hardware_plugin.accelerators.xpu.profilers.register_vtune.apply") as fake_vtune_apply,
+            mock.patch("verl_hardware_plugin.accelerators.xpu.patches.numa_affinity_patch.apply") as fake_numa_apply,
+        ):
             PlatformXPU()
 
         fake_apply.assert_called_once()
+        fake_pin_apply.assert_called_once()
+        fake_vtune_apply.assert_called_once()
+        fake_numa_apply.assert_called_once()
 
     def test_platform_tpu_init_applies_patches(self):
         with mock.patch("verl_hardware_plugin.accelerators.tpu.patches.reduce_avg_allreduce_patch.apply") as fake_apply:
