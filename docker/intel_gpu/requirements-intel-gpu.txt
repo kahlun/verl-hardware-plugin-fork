@@ -70,11 +70,11 @@ latex2sympy2_extended
 math_verify
 mathruler
 msgspec
-numpy<2.0.0
+numpy>=2.0.0
 packaging>=20.0
 pandas
 peft>=0.15.2
-pyarrow>=15.0.0
+pyarrow>=19.0.0
 pybind11
 pylatexenc
 qwen_vl_utils
