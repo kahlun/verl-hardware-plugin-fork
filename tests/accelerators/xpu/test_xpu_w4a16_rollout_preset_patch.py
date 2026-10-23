@@ -76,7 +76,9 @@ def test_real_verl_accepts_the_preset():
     before = dict(compressed_tensors.SUPPORTED_SCHEMES)
     try:
         patch.apply()
-        config = compressed_tensors.build_compressed_tensors_config(linear="W4A16", moe=None, ignore=[], config_file=None)
+        config = compressed_tensors.build_compressed_tensors_config(
+            linear="W4A16", moe=None, ignore=[], config_file=None
+        )
         group = next(iter(config["config_groups"].values()))
         assert group["format"] == "pack-quantized"
         assert group["weights"]["num_bits"] == 4 and group["weights"]["group_size"] == 128
