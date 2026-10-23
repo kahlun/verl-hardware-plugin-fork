@@ -32,29 +32,67 @@ plugin-side monkeypatch over `torch.distributed.all_reduce`
 
 ## 1. Install verl and verl-hardware-plugin
 
-Pick one. Both give the same environment (checked: torch 2.13.0+xpu, vLLM 0.29.0+xpu, transformers 5.17.0).
+Pick one. Both install the same set of packages (torch 2.13.0+xpu, vLLM 0.29.0+xpu, transformers 5.17.0): the Docker
+image runs the commands of Option B.
 
 ### Option A: Docker (recommended)
 
-The Intel GPU image is maintained with verl-core, in
-[`docker/xpu/`](https://github.com/verl-project/verl/tree/main/docker/xpu). It installs verl and this plugin
-together, so there is nothing else to do. Build and run steps are in that directory's README.
+The image is built from `docker/xpu/` in verl-core. It installs verl and this plugin together, so nothing else is
+needed. Pin the two checkouts with `--build-arg VERL_REF=<commit> --build-arg PLUGIN_REF=<commit>`; for release builds
+add `--no-cache` so the system certificates, `pip`, `certifi` and `uv` are fetched fresh.
+
+```bash
+git clone https://github.com/verl-project/verl.git && cd verl
+docker build -f docker/xpu/Dockerfile.stable.vllm -t verl:xpu-vllm029 .
+docker run --rm -it --device /dev/dri --ipc=host --privileged verl:xpu-vllm029
+```
 
 ### Option B: From source
 
 verl pins its own versions, and `pip install -e .` on a verl checkout can replace the XPU build of torch with a
-different one (it also downgrades `transformers` and `tensordict` to verl's pins). Install the XPU dependency
-set the way verl-core documents it, in
-[`docker/xpu/README.md` ("Installing Without Docker")](https://github.com/verl-project/verl/blob/main/docker/xpu/README.md),
-which uses verl's `requirements-xpu.txt`. Then install this plugin on top of that environment:
+different one (it also moves `transformers` and `tensordict` to verl's pins). Install the dependencies as below and
+add verl and the plugin with `--no-deps`.
+
+System packages on the host: `g++`/`gcc` and the Python 3.12 headers (Triton compiles its launcher stubs at first
+use), `libnuma-dev`, `libze-dev` (it provides the unversioned `libze_loader.so` that oneCCL opens; without it `xccl`
+fails with "ze_data was not initialized"), and `ffmpeg` (the FFmpeg shared libraries that `torchcodec` needs to decode
+video).
 
 ```bash
-git clone https://github.com/verl-project/verl-hardware-plugin.git
-cd verl-hardware-plugin
+# Use pip >= 26.2.2 and uv >= 0.13.4 (both carry the corrected CA bundle).
+uv venv --python 3.12 --seed /opt/venv && source /opt/venv/bin/activate
+export UV_INDEX_URL=https://download.pytorch.org/whl/xpu UV_EXTRA_INDEX_URL=https://pypi.org/simple \
+       UV_INDEX_STRATEGY=unsafe-best-match VLLM_TARGET_DEVICE=xpu
+
+# vLLM XPU wheel (the PyPI wheel has no XPU kernels). --extra-index-url on the command line replaces
+# UV_EXTRA_INDEX_URL, so PyPI is repeated.
+uv pip install "vllm==0.29.0+xpu" \
+    --extra-index-url https://wheels.vllm.ai/0.29.0/xpu --extra-index-url https://wheels.vllm.ai/xpu \
+    --extra-index-url https://pypi.org/simple
+
+git clone https://github.com/verl-project/verl.git && cd verl
+grep -v '^transformers' requirements.txt > /tmp/requirements-core.txt
+echo 'pyzes>=0.1.2' > /tmp/override-pyzes.txt   # torch pins pyzes==0.1.1; the device-memory query needs >= 0.1.2
+
+# --no-config: run inside a verl checkout, uv would otherwise read verl's pyproject [tool.uv] overrides
+# (transformers 5.12.1, kernels<0.15 for the CUDA stack) and they would beat the XPU pins below.
+uv --no-config pip install -r /tmp/requirements-core.txt \
+    "torch==2.13.0+xpu" "transformers==5.17.0" "kernels>=0.16.0,<0.17.0" \
+    dpctl "pyzes>=0.1.2" triton-xpu "pip>=26.2.2" "certifi>=2026.10.19" qwen_vl_utils mathruler \
+    --override /tmp/override-pyzes.txt
+uv --no-config pip install --no-deps -e .
+
+# liger-kernel pulls the CUDA triton, which shares triton/ with triton-xpu: keep triton-xpu only.
+TRITON_XPU="$(uv pip freeze | grep -i '^triton-xpu==')"
+uv pip uninstall triton
+uv pip install --reinstall --no-deps "${TRITON_XPU}" --extra-index-url https://download.pytorch.org/whl/xpu
+
+# This plugin, on top of that environment:
+cd .. && git clone https://github.com/verl-project/verl-hardware-plugin.git && cd verl-hardware-plugin
 pip install --no-deps -e .
 ```
 
-`--no-deps` keeps the plugin install from touching the torch/verl already in place. The plugin needs no
+`--no-deps` keeps the plugin install from touching the torch and verl already in place. The plugin needs no
 environment variable: it is auto-discovered by verl through the `verl.plugins` setuptools entry_points
 group declared in this repo's `pyproject.toml`
 (`[project.entry-points."verl.plugins"] hardware = "verl_hardware_plugin"`), which verl loads by default

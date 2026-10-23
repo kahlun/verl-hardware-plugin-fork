@@ -58,9 +58,8 @@ docs/accelerators/xpu/
 
 ## Docker
 
-A ready-made Intel GPU image (verl + this plugin + vLLM) is maintained with verl-core in
-[`docker/xpu/`](https://github.com/verl-project/verl/tree/main/docker/xpu). A system oneAPI install is not
-needed at runtime; see the [installation guide](./install_guidance.md).
+An Intel GPU image (verl + this plugin + vLLM) is built from `docker/xpu/` in verl-core. A system oneAPI install is
+not needed at runtime. Build and run commands are in the [installation guide](./install_guidance.md).
 
 ## Related Documentation
 
