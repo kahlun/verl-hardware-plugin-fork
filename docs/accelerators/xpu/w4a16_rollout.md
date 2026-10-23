@@ -39,22 +39,15 @@ Measured on one Arc Pro B60, as the mean `|p_rollout - p_trainer|` of sampled to
 | Qwen2.5-0.5B-Instruct | 0.004 | 0.076 to 0.083 (10-step GRPO) |
 | Qwen2.5-1.5B-Instruct (2 GPUs) | 0.003 to 0.004 | 0.048 at step 1, then 0.08 to 0.17 (8-step GRPO) |
 
-The 1.5B W4A16 run also became unstable without rollout correction: the mean response length fell from
-about 210 to about 22 tokens at steps 2 and 3 (partly recovering to about 140 by step 8) and the gradient
-norm rose from about 1 to 4-22. The BF16 run on the same setup stayed flat. One seed, 8 steps, no
-correction; treat it as a warning, not a measurement.
+In one 8-step 1.5B run (256-token responses) W4A16 became unstable without rollout correction: the mean
+response length fell from about 210 to about 22 tokens at steps 2 and 3 (partly recovering to about 140 by
+step 8) and the gradient norm rose from about 1 to 4-22; the BF16 run on the same setup stayed flat. Later runs
+on a newer image (768 to 1024-token responses, 3 to 6 steps, mismatch 0.05 to 0.07) did not collapse: response
+length stayed at 176 to 409 tokens, and with token-level importance sampling (threshold 2) the gradient norm
+stayed near 1. These are single short runs, so they show neither that W4A16 is stable nor that it is unstable.
 
-The same quantity measured offline on 32 sampled prompts (temperature 1, 96 tokens) with fake-quantised
-weights, for other quantisers:
-
-| model | verl exporter (round-to-nearest) | AutoRound, activation-aware (`iters=0`) | AutoRound, tuned (`iters=50`) |
-|---|---|---|---|
-| 0.5B | 0.081 | 0.060 | 0.055 |
-| 3B | 0.068 | 0.036 | 0.040 |
-
-So weights quantised with calibration data are noticeably closer to BF16 than the exporter's
-round-to-nearest, but the exporter has no activation statistics to use. Use rollout correction
-(`algorithm.rollout_correction`) and watch `training/rollout_probs_diff_mean`.
+On that newer image (`verl-xpu-neat`, vLLM 0.29, torch 2.13) W4A16 generation was not faster than BF16 at
+1.5B (8 to 18 s per step for both), and the weight sync took 3.5 to 4.2 s against 4.0 to 4.8 s.
 
 ## Limits
 
