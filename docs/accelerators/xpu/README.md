@@ -17,6 +17,7 @@ verl_hardware_plugin/accelerators/xpu/
 ├── engines/fsdp_xpu.py              # FSDP/FSDP2 actor + critic engines
 ├── engines/megatron_xpu.py          # Megatron engine registration (Work in Progress — not yet validated end-to-end)
 ├── patches/reduce_avg_allreduce_patch.py  # xccl ReduceOp.AVG workaround
+├── patches/w4a16_rollout_preset_patch.py  # adds the W4A16 rollout.quantization preset
 ├── profilers/itt_profile_xpu.py     # ITT range markers + VtuneProfiler
 └── profilers/register_vtune.py      # claims `profiler.tool: vtune`
 ```
@@ -26,7 +27,8 @@ docs/accelerators/xpu/
 ├── README.md              # This file
 ├── install_guidance.md    # Installation guide
 ├── quick_start.md         # Quick start
-└── profiling.md           # Intel VTune (ITT) profiling
+├── profiling.md           # Intel VTune (ITT) profiling
+└── w4a16_rollout.md       # INT4 (W4A16) rollout quantization
 ```
 
 ## Getting Started
@@ -34,6 +36,7 @@ docs/accelerators/xpu/
 - [Installation Guide](./install_guidance.md) — prerequisites and environment setup
 - [Quick Start](./quick_start.md) — run a GRPO training example and verify the platform
 - [Profiling](./profiling.md) — capture an Intel VTune (ITT) trace
+- [INT4 (W4A16) rollout](./w4a16_rollout.md) — weight-only INT4 rollout quantization
 
 ## Platform Summary
 
