@@ -753,6 +753,19 @@ class TestMayEnableFlagGems:
                         may_enable_flag_gems(phase="training")
 
 
+class TestXPURayDeviceIndex:
+    """PlatformXPU pins Ray's physical device id, ignoring ZE_AFFINITY_MASK."""
+
+    def test_returns_physical_id_even_when_masked(self):
+        from verl_hardware_plugin.accelerators.xpu.platform_xpu import PlatformXPU
+
+        platform = PlatformXPU.__new__(PlatformXPU)
+        with mock.patch.dict(os.environ, {"ZE_AFFINITY_MASK": "2"}):
+            assert platform.ray_device_index(["2"]) == 2
+        with mock.patch.dict(os.environ, {}, clear=True):
+            assert platform.ray_device_index(["3"]) == 3
+
+
 class TestXPUCollectiveModule:
     """get_collective_module() must return the cupy.cuda.nccl-shaped XCCL shim.
 
