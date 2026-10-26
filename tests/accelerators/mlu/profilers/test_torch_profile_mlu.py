@@ -12,6 +12,7 @@ TypeError'd on this call for every platform, not just MLU, the moment
 """
 
 import inspect
+from unittest import mock
 
 import pytest
 
@@ -55,7 +56,20 @@ def test_get_torch_profiler_accepts_new_kwargs_for_non_mlu_contents(tmp_path):
     assert prof is not None
 
 
-def test_trace_filenames_unique_on_window_boundary_stop(tmp_path):
+def test_non_mlu_host_delegates_to_verl_profiler(monkeypatch):
+    # Every backend registers on every host: off MLU, verl's own profiler picks the device activity.
+    torch_profile_mlu._patch_get_torch_profiler()
+    original = mock.Mock()
+    monkeypatch.setattr(torch_profile_mlu, "_original_get_torch_profiler", original)
+    monkeypatch.setattr(torch_profile_mlu, "_mlu_present", lambda: False)
+
+    prof = tp.get_torch_profiler(contents=[], save_path="/tmp/test", rank=0)
+
+    assert prof is original.return_value
+    original.assert_called_once_with(contents=[], save_path="/tmp/test", rank=0)
+
+
+def test_trace_filenames_unique_on_window_boundary_stop(tmp_path, monkeypatch):
     """
     This test ensures filenames remain unique by verifying that two trace files
     are created with distinct "_c0" and "_c1" callback counter suffixes.
@@ -63,6 +77,7 @@ def test_trace_filenames_unique_on_window_boundary_stop(tmp_path):
     import os
 
     torch_profile_mlu._patch_get_torch_profiler()
+    monkeypatch.setattr(torch_profile_mlu, "_mlu_present", lambda: True)
 
     # Create a real torch profiler instance with schedule
     save_dir = tmp_path
