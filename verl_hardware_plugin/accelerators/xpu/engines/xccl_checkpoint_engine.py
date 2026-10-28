@@ -74,6 +74,57 @@ def _broadcast(pg: dist.ProcessGroup, tensor: torch.Tensor) -> None:
     pg.broadcast([tensor], opts).wait()
 
 
+# Offsets inside a bucket are rounded up to this many bytes. The receiver rebuilds a weight with
+# ``chunk.view(dtype)``, which needs the chunk to start at a multiple of the element size, and a bucket can mix dtypes.
+# 16 covers every torch dtype.
+_ALIGN = 16
+
+
+def _place(offset: int, size: int, bucket_size: int) -> tuple[int, bool]:
+    """Where the next chunk of ``size`` bytes starts in a bucket that is filled up to ``offset``.
+
+    Returns ``(start, flush)``. When ``flush`` is true the current bucket has to be sent first and the chunk starts
+    a new one at 0. The sender and the relay both lay buckets out with this function, so their bucket boundaries
+    cannot drift apart.
+    """
+    start = -(-offset // _ALIGN) * _ALIGN
+    if start + size > bucket_size:
+        return 0, True
+    return start, False
+
+
+def _wait_for_subscribers(socket: zmq.Socket, subscribed: int, expected: int, timeout_s: float = 60.0) -> int:
+    """Read the subscription frames of an XPUB socket until ``expected`` consumers are subscribed.
+
+    ZeroMQ silently drops a PUB message that has no matching subscription yet, so publishing right after the
+    consumers called ``connect`` can lose a bucket's metadata and leave them blocked in ``recv``. Only the publisher
+    can tell that a subscription has arrived, and an XPUB socket hands it the subscription frames.
+
+    ZeroMQ reports a consumer leaving only when it was the last one on the topic, so a consumer that disconnects
+    while others stay subscribed is not seen here; consumers restarting mid-run is not supported by this engine.
+
+    Returns the updated number of live subscriptions.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        # Drain what is already queued first, so an unsubscribe that is already waiting is applied before
+        # deciding whether enough consumers are subscribed.
+        if not socket.poll(0, zmq.POLLIN):
+            if subscribed >= expected:
+                return subscribed
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0 or not socket.poll(remaining_ms, zmq.POLLIN):
+                raise TimeoutError(
+                    f"only {subscribed} of {expected} consumers subscribed to the bucket metadata stream "
+                    f"within {timeout_s:.0f}s"
+                )
+        frame = socket.recv()
+        if frame[:1] == b"\x01":
+            subscribed += 1
+        elif frame[:1] == b"\x00":
+            subscribed -= 1
+
+
 class BroadcastOperation:
     """Async broadcast operation with XCCL in separate thread.
 
@@ -177,6 +228,8 @@ class XCCLCheckpointEngine(CheckpointEngine):
         self._store: dist.TCPStore | None = None
         self.rank = -1
         self.world_size = -1
+        self._zmq_endpoint: tuple[str, int] | None = None
+        self._subscribers = 0
 
         # start zeromq server for broadcasting bucket tensor metadata
         self.is_master = is_master
@@ -286,7 +339,10 @@ class XCCLCheckpointEngine(CheckpointEngine):
         self.listen_port, _ = get_free_port(self.ip)
 
         context = zmq.Context()
-        self.socket = context.socket(zmq.PUB)
+        # XPUB is a PUB socket that also reports the consumers' subscriptions, see `_wait_for_subscribers`.
+        self.socket = context.socket(zmq.XPUB)
+        # report every consumer's subscription, not only the first one per topic
+        self.socket.setsockopt(zmq.XPUB_VERBOSE, 1)
         if is_valid_ipv6_address(self.ip):
             address = f"tcp://[{self.ip}]:{self.listen_port}"
             self.socket.setsockopt(zmq.IPV6, 1)
@@ -334,7 +390,15 @@ class XCCLCheckpointEngine(CheckpointEngine):
 
     def _connect_zmq_client(self, metadata: MasterMetadata):
         assert not self.is_master, "Master process should not connect to other processes."
-        context = zmq.Context()
+        endpoint = (metadata.zmq_ip, metadata.zmq_port)
+        if self._zmq_endpoint == endpoint:
+            # Keep the subscription from the previous sync: it is already known to the publisher, and a fresh
+            # socket per sync would leak one.
+            return
+        previous = getattr(self, "socket", None)
+        if previous is not None:
+            previous.close(linger=0)
+        context = zmq.Context.instance()
         self.socket = context.socket(zmq.SUB)
         if is_valid_ipv6_address(metadata.zmq_ip):
             address = f"tcp://[{metadata.zmq_ip}]:{metadata.zmq_port}"
@@ -344,6 +408,7 @@ class XCCLCheckpointEngine(CheckpointEngine):
 
         self.socket.connect(address)
         self.socket.setsockopt_string(zmq.SUBSCRIBE, self.topic)
+        self._zmq_endpoint = endpoint
 
     def init_process_group(self, rank: int, world_size: int, master_metadata: MasterMetadata, num_senders: int):
         """Initialize the XCCL process group.
@@ -380,6 +445,11 @@ class XCCLCheckpointEngine(CheckpointEngine):
         # barrier, which also builds the lazily created communicator while every rank is here
         signal = torch.ones(1, dtype=torch.int32, device="xpu")
         self.pg.allreduce([signal]).wait()
+
+        # The barrier says nothing about the ZeroMQ side, which is a separate connection: make sure every
+        # consumer's subscription has reached the publisher before the first bucket's metadata goes out.
+        if self.is_master:
+            self._subscribers = _wait_for_subscribers(self.socket, self._subscribers, world_size - num_senders)
 
         logger.info(f"init_process_group rank: {self.rank}, world_size: {self.world_size}")
 
@@ -421,7 +491,8 @@ class XCCLCheckpointEngine(CheckpointEngine):
         offset = 0
         async for tensor_meta, chunk in split_weight_chunks(weights, self.bucket_size):
             # fill the tensor bucket
-            if offset + tensor_meta.chunk_size > self.bucket_size:
+            start, flush = _place(offset, tensor_meta.chunk_size, self.bucket_size)
+            if flush:
                 torch.xpu.synchronize()
 
                 # wait previous broadcast op finish
@@ -440,7 +511,7 @@ class XCCLCheckpointEngine(CheckpointEngine):
                 # swap send_buf and recv_buf
                 send_buf, recv_buf = recv_buf, send_buf
                 bucket_meta = {}
-                offset = 0
+            offset = start
 
             assert offset + tensor_meta.chunk_size <= self.bucket_size
             assert tensor_meta.name not in bucket_meta
@@ -491,11 +562,10 @@ class XCCLCheckpointEngine(CheckpointEngine):
 
         # a single buffer suffices: nothing reads the bucket, so successive broadcasts can share it
         async for tensor_meta, _ in split_weight_chunks(weights, self.bucket_size, meta_only=True):
-            if offset + tensor_meta.chunk_size > self.bucket_size:
+            start, flush = _place(offset, tensor_meta.chunk_size, self.bucket_size)
+            if flush:
                 _broadcast(self.pg, self.recv_buf[:offset])
-                offset = 0
-
-            offset += tensor_meta.chunk_size
+            offset = start + tensor_meta.chunk_size
 
         # relay last bucket
         _broadcast(self.pg, self.recv_buf[:offset])
