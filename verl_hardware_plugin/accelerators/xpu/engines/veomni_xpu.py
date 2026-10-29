@@ -57,9 +57,11 @@ def _log_xpu_memory(tag: str) -> None:
     import torch
 
     gb = 1024**3
+    free, total = torch.xpu.mem_get_info()
     print(
-        f"[xpu-mem] pid={os.getpid()} {tag}: alloc={torch.xpu.memory_allocated() / gb:.2f}G "
-        f"reserved={torch.xpu.memory_reserved() / gb:.2f}G max_alloc={torch.xpu.max_memory_allocated() / gb:.2f}G",
+        f"[xpu-mem] pid={os.getpid()} dev={torch.xpu.current_device()} {tag}: alloc={torch.xpu.memory_allocated() / gb:.2f}G "
+        f"reserved={torch.xpu.memory_reserved() / gb:.2f}G max_alloc={torch.xpu.max_memory_allocated() / gb:.2f}G "
+        f"dev_free={free / gb:.2f}G/{total / gb:.2f}G",
         flush=True,
     )
 
