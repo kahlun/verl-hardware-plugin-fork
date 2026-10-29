@@ -35,9 +35,36 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _log_xpu_memory(tag: str) -> None:
+    """Print device memory when VERL_XPU_MEMLOG=1 (debugging aid for UR_RESULT_ERROR_OUT_OF_RESOURCES)."""
+    if os.getenv("VERL_XPU_MEMLOG") != "1":
+        return
+    import torch
+
+    gb = 1024**3
+    print(
+        f"[xpu-mem] pid={os.getpid()} {tag}: alloc={torch.xpu.memory_allocated() / gb:.2f}G "
+        f"reserved={torch.xpu.memory_reserved() / gb:.2f}G max_alloc={torch.xpu.max_memory_allocated() / gb:.2f}G",
+        flush=True,
+    )
+
+
 @EngineRegistry.register(model_type="language_model", backend=["veomni"], device="xpu", vendor="intel")
 class VeOmniXPUEngineWithLMHead(VeOmniEngineWithLMHead):
     """VeOmni LM engine for Intel XPU with xccl communication backend."""
+
+    def forward_backward_batch(self, *args, **kwargs):
+        _log_xpu_memory("before forward_backward_batch")
+        try:
+            return super().forward_backward_batch(*args, **kwargs)
+        finally:
+            _log_xpu_memory("after forward_backward_batch")
+
+    def to(self, *args, **kwargs):
+        _log_xpu_memory(f"before to({args})")
+        out = super().to(*args, **kwargs)
+        _log_xpu_memory(f"after to({args})")
+        return out
 
     def initialize(self):
         super().initialize()
