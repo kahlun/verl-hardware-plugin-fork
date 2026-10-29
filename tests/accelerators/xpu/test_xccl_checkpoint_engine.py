@@ -38,6 +38,14 @@ def test_registered_under_xccl():
     assert CheckpointEngineRegistry.get("xccl") is engine.XCCLCheckpointEngine
 
 
+def test_also_registered_as_nccl_so_the_stock_configs_work_unchanged():
+    from verl.checkpoint_engine import CheckpointEngineRegistry
+
+    # The trainer configs default to "nccl"; on XPU that name must reach this engine, as it reaches HCCL on Ascend.
+    assert CheckpointEngineRegistry.get("nccl") is engine.XCCLCheckpointEngine
+    assert CheckpointEngineRegistry.get("xccl") is engine.XCCLCheckpointEngine
+
+
 def test_multi_sender_is_off_by_default():
     import inspect
 

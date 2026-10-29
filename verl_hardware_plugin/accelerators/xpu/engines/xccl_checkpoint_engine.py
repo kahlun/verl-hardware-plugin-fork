@@ -183,6 +183,10 @@ class BroadcastOperation:
         return self.metadata
 
 
+# "nccl" is the name the disaggregated trainer configs ship with. On Ascend verl's HCCL engine takes that name too, so
+# the stock configs run unchanged; this does the same for XPU. verl's own NCCL engine cannot be imported here (cupy,
+# hard-coded "cuda"), so nothing is shadowed. If it ever becomes usable on XPU, drop this alias or it will override it.
+@CheckpointEngineRegistry.register("nccl")
 @CheckpointEngineRegistry.register("xccl")
 class XCCLCheckpointEngine(CheckpointEngine):
     """XCCL (oneCCL) checkpoint engine for Intel GPUs, the counterpart of the NCCL engine.
@@ -190,8 +194,10 @@ class XCCLCheckpointEngine(CheckpointEngine):
     The process group is a torch `ProcessGroupXCCL` over a TCPStore hosted by actor rank 0, so it needs
     neither `ray.util.collective`, cupy nor vLLM, and it leaves the default torch.distributed world alone.
 
-    Registered as backend ``"xccl"`` when the plugin loads on an XPU host (see ``../registration.py``); select it
-    with ``actor_rollout_ref.rollout.checkpoint_engine.backend=xccl``. The transport is confined to
+    Registered as backend ``"xccl"`` and, like verl's HCCL engine on Ascend, also as ``"nccl"`` when the plugin loads
+    on an XPU host (see ``../registration.py``). The one-step-off and fully-async trainer configs already default to
+    ``checkpoint_engine.backend: nccl``, so on XPU they need no override; ``backend=xccl`` selects it explicitly.
+    ``engine_kwargs`` are looked up under whichever name is configured. The transport is confined to
     ``_start_store``, ``_create_process_group``, ``_destroy_process_group`` and ``_broadcast``, which is where a
     different transport (a Ray collective group, a vLLM communicator) would plug in.
 
