@@ -18,3 +18,8 @@ try:
     from verl_hardware_plugin.accelerators.xpu.engines import megatron_xpu  # noqa: F401
 except Exception as exc:
     logger.debug("XPU Megatron engine registration failed: %s", exc)
+
+try:
+    from verl_hardware_plugin.accelerators.xpu.engines import veomni_xpu  # noqa: F401
+except Exception as exc:
+    logger.debug("XPU VeOmni engine registration failed: %s", exc)
