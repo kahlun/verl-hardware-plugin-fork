@@ -210,10 +210,9 @@ class XCCLCheckpointEngine(CheckpointEngine):
         rollout_dtype (torch.dtype): The dtype of the weights received from rollout workers. Defaults to torch.bfloat16.
         multi_sender (bool): Whether to also admit the source's node-local actor workers into the
             broadcast group as relays, widening the fan-out at the root. Defaults to False, which
-            keeps the group at one sender (actor rank 0) plus the rollout workers. Leave it off on
-            XPU for now: with a real FSDP weight generator and several buckets, the relay path
-            stalled after the first bucket (the broadcast blocks the host until every rank joins, while
-            the actor ranks also need each other for the next all-gather).
+            keeps the group at one sender (actor rank 0) plus the rollout workers. verl's NCCL engine
+            defaults to True. It is off here because one end-to-end GRPO run with True stalled after the first
+            bucket; the cause has not been found, and the mock-receiver tests pass with True.
     """
 
     def __init__(
@@ -234,6 +233,8 @@ class XCCLCheckpointEngine(CheckpointEngine):
         self._store: dist.TCPStore | None = None
         self.rank = -1
         self.world_size = -1
+        self.send_buf: torch.Tensor | None = None
+        self.recv_buf: torch.Tensor | None = None
         self._zmq_endpoint: tuple[str, int] | None = None
         self._subscribers = 0
 
@@ -254,9 +255,8 @@ class XCCLCheckpointEngine(CheckpointEngine):
         return ray.get_runtime_context().get_node_id()
 
     def prepare(self) -> WorkerMetadata:
-        self.send_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="xpu")
-        self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="xpu")
-
+        # The transfer buffers are allocated in `init_process_group`, once it is known that this rank takes part:
+        # with the default single sender every trainer rank but 0 sits the broadcast out and needs none.
         # A fresh id per round keeps a rebuilt group's keys apart from the previous one's in the store.
         master = (
             MasterMetadata(
@@ -394,6 +394,16 @@ class XCCLCheckpointEngine(CheckpointEngine):
             except Exception as e:
                 logger.warning(f"XCCL process group shutdown failed: {e}")
 
+    def _allocate_buffers(self):
+        """Allocate the transfer buffers for a rank that is in the group; `finalize` frees them again.
+
+        The sender and the consumers double-buffer. A relay only broadcasts into one buffer it never reads, so it
+        gets a single one.
+        """
+        is_relay = 0 < self.rank < self.num_senders
+        self.recv_buf = torch.zeros(self.bucket_size, dtype=torch.uint8, device="xpu")
+        self.send_buf = None if is_relay else torch.zeros(self.bucket_size, dtype=torch.uint8, device="xpu")
+
     def _connect_zmq_client(self, metadata: MasterMetadata):
         assert not self.is_master, "Master process should not connect to other processes."
         endpoint = (metadata.zmq_ip, metadata.zmq_port)
@@ -445,6 +455,8 @@ class XCCLCheckpointEngine(CheckpointEngine):
                 f"world_size {world_size} is not equal to self.world_size {self.world_size}"
             )
 
+        self._allocate_buffers()
+
         # Only consumers read the bucket metadata stream; relays never touch the payload.
         if self.rank >= num_senders:
             self._connect_zmq_client(master_metadata)
@@ -483,6 +495,7 @@ class XCCLCheckpointEngine(CheckpointEngine):
             await self._relay_weights(weights)
             return
 
+        assert self.send_buf is not None and self.recv_buf is not None, "init_process_group allocates the buffers"
         send_buf, recv_buf = self.send_buf, self.recv_buf
         broadcast_op = None
 
@@ -563,6 +576,7 @@ class XCCLCheckpointEngine(CheckpointEngine):
         collective over the actor group, so blocking on the wire would deadlock against rank 0's
         own gathers.
         """
+        assert self.recv_buf is not None, "init_process_group allocates the buffers"
         start_time = time.time()
         offset = 0
 
@@ -601,6 +615,7 @@ class XCCLCheckpointEngine(CheckpointEngine):
             A tuple of the name of the weight tensor and the chunk itself.
         """
         assert self.rank > 0, "Rank 0 should not receive weights."
+        assert self.send_buf is not None and self.recv_buf is not None, "init_process_group allocates the buffers"
         send_buf, recv_buf = self.send_buf, self.recv_buf
         total_bytes, total_params = 0, 0
 

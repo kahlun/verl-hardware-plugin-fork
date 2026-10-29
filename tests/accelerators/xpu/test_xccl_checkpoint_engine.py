@@ -235,3 +235,49 @@ def test_consumer_keeps_its_subscription_while_the_endpoint_is_unchanged():
     assert consumer.socket is not first
     assert first.closed
     consumer.socket.close(linger=0)
+
+
+# --- transfer buffers: only ranks that take part in the broadcast allocate them ---------------------------------
+
+
+class _Zeros:
+    """Records the torch.zeros calls the engine makes instead of touching an XPU."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *shape, **kwargs):
+        self.calls.append((shape, kwargs.get("device")))
+        return object()
+
+
+def _engine_with(monkeypatch, rank, num_senders, bucket_size=1024):
+    zeros = _Zeros()
+    monkeypatch.setattr(engine.torch, "zeros", zeros)
+    eng = object.__new__(engine.XCCLCheckpointEngine)
+    eng.bucket_size, eng.rank, eng.num_senders = bucket_size, rank, num_senders
+    eng.send_buf = eng.recv_buf = None
+    return eng, zeros
+
+
+def test_sender_and_consumers_get_two_buffers(monkeypatch):
+    # rank 0 is the sender (one sender); rank 2 is a consumer when there are two senders (ranks 0 and 1)
+    for rank, num_senders in ((0, 1), (2, 2)):
+        eng, zeros = _engine_with(monkeypatch, rank=rank, num_senders=num_senders)
+        eng._allocate_buffers()
+        assert len(zeros.calls) == 2, rank
+        assert eng.send_buf is not None and eng.recv_buf is not None
+
+
+def test_a_relay_only_needs_one_buffer(monkeypatch):
+    eng, zeros = _engine_with(monkeypatch, rank=1, num_senders=2)
+    eng._allocate_buffers()
+    assert len(zeros.calls) == 1
+    assert eng.recv_buf is not None and eng.send_buf is None
+
+
+def test_a_rank_left_out_of_the_group_allocates_nothing(monkeypatch):
+    eng, zeros = _engine_with(monkeypatch, rank=-1, num_senders=1)
+    eng.init_process_group(rank=-1, world_size=3, master_metadata=MASTER, num_senders=1)
+    assert zeros.calls == []
+    assert eng.send_buf is None and eng.recv_buf is None
