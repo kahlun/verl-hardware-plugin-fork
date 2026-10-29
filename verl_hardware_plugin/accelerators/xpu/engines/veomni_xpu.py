@@ -50,6 +50,25 @@ def _release_xpu_cache() -> None:
     torch.xpu.empty_cache()
 
 
+def _release_xpu_cache_if_bloated() -> None:
+    """Per-micro-batch guard: free the allocator cache once it has ballooned.
+
+    Variable sequence lengths make the XPU caching allocator request new, differently
+    sized segments instead of reusing cached ones. Within a single log-prob pass the
+    reserved pool can fill the whole card (22.96 GB reserved vs 3 GB allocated, 0 GB free
+    on a 24 GB B60), and the next allocation then fails with a raw
+    UR_RESULT_ERROR_OUT_OF_RESOURCES instead of freeing the cache and retrying.
+    Threshold: VERL_XPU_EMPTY_CACHE_RESERVED_GB (default 8; 0 = every micro-batch).
+    """
+    if os.getenv("VERL_XPU_EMPTY_CACHE", "1") == "0":
+        return
+    import torch
+
+    limit = float(os.getenv("VERL_XPU_EMPTY_CACHE_RESERVED_GB", "8")) * 1024**3
+    if torch.xpu.memory_reserved() > limit:
+        torch.xpu.empty_cache()
+
+
 def _log_xpu_memory(tag: str) -> None:
     """Print device memory when VERL_XPU_MEMLOG=1 (debugging aid for UR_RESULT_ERROR_OUT_OF_RESOURCES)."""
     if os.getenv("VERL_XPU_MEMLOG") != "1":
@@ -69,6 +88,12 @@ def _log_xpu_memory(tag: str) -> None:
 @EngineRegistry.register(model_type="language_model", backend=["veomni"], device="xpu", vendor="intel")
 class VeOmniXPUEngineWithLMHead(VeOmniEngineWithLMHead):
     """VeOmni LM engine for Intel XPU with xccl communication backend."""
+
+    def forward_step(self, *args, **kwargs):
+        try:
+            return super().forward_step(*args, **kwargs)
+        finally:
+            _release_xpu_cache_if_bloated()
 
     def forward_backward_batch(self, *args, **kwargs):
         _log_xpu_memory("before forward_backward_batch")
