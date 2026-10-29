@@ -13,13 +13,23 @@ force SUM + manual division on every FSDP2 module after initialization.
 No core code is patched; this is ordinary subclassing.
 """
 
+import importlib
 import logging
 import os
+import sys
 
-from verl.workers.engine.base import EngineRegistry
-from verl.workers.engine.veomni.transformer_impl import VeOmniEngineWithLMHead, VeOmniEngineWithValueHead
+try:
+    importlib.import_module("veomni.models.checkpoint_tensor_loading")
+except ModuleNotFoundError:
+    # VeOmni main moved this module to veomni.models.checkpoint.convert (VeOmni#1142,
+    # same functions); verl main still imports the old path. Alias it so the unmodified
+    # core engine module imports against VeOmni main.
+    sys.modules["veomni.models.checkpoint_tensor_loading"] = importlib.import_module("veomni.models.checkpoint.convert")
 
-from .fsdp_xpu import _force_sum_reduction_on_all_fsdp_modules
+from verl.workers.engine.base import EngineRegistry  # noqa: E402
+from verl.workers.engine.veomni.transformer_impl import VeOmniEngineWithLMHead, VeOmniEngineWithValueHead  # noqa: E402
+
+from .fsdp_xpu import _force_sum_reduction_on_all_fsdp_modules  # noqa: E402
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
