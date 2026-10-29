@@ -35,6 +35,21 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _release_xpu_cache() -> None:
+    """Return the allocator's cached-but-unused device memory after each engine pass.
+
+    The VeOmni engine never calls empty_cache() between phases, so on a card shared with
+    colocated vLLM the XPU caching allocator keeps growing its reserved pool (measured
+    ~20 GB reserved vs ~3 GB allocated on a 24 GB B60) until a later allocation fails with
+    UR_RESULT_ERROR_OUT_OF_RESOURCES. Set VERL_XPU_EMPTY_CACHE=0 to disable.
+    """
+    if os.getenv("VERL_XPU_EMPTY_CACHE", "1") == "0":
+        return
+    import torch
+
+    torch.xpu.empty_cache()
+
+
 def _log_xpu_memory(tag: str) -> None:
     """Print device memory when VERL_XPU_MEMLOG=1 (debugging aid for UR_RESULT_ERROR_OUT_OF_RESOURCES)."""
     if os.getenv("VERL_XPU_MEMLOG") != "1":
@@ -58,6 +73,7 @@ class VeOmniXPUEngineWithLMHead(VeOmniEngineWithLMHead):
         try:
             return super().forward_backward_batch(*args, **kwargs)
         finally:
+            _release_xpu_cache()
             _log_xpu_memory("after forward_backward_batch")
 
     def to(self, *args, **kwargs):
