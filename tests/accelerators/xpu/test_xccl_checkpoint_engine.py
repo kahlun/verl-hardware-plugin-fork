@@ -46,11 +46,11 @@ def test_also_registered_as_nccl_so_the_stock_configs_work_unchanged():
     assert CheckpointEngineRegistry.get("xccl") is engine.XCCLCheckpointEngine
 
 
-def test_multi_sender_is_off_by_default():
+def test_multi_sender_is_on_by_default_like_the_nccl_engine():
     import inspect
 
     default = inspect.signature(engine.XCCLCheckpointEngine.__init__).parameters["multi_sender"].default
-    assert default is False
+    assert default is True
 
 
 def test_single_sender_only_actor_rank0_joins():

@@ -209,10 +209,8 @@ class XCCLCheckpointEngine(CheckpointEngine):
         is_master (bool): Whether the current process is the master process. Defaults to False.
         rollout_dtype (torch.dtype): The dtype of the weights received from rollout workers. Defaults to torch.bfloat16.
         multi_sender (bool): Whether to also admit the source's node-local actor workers into the
-            broadcast group as relays, widening the fan-out at the root. Defaults to False, which
-            keeps the group at one sender (actor rank 0) plus the rollout workers. verl's NCCL engine
-            defaults to True. It is off here because one end-to-end GRPO run with True stalled after the first
-            bucket; the cause has not been found, and the mock-receiver tests pass with True.
+            broadcast group as relays, widening the fan-out at the root. Defaults to True, as in verl's NCCL
+            engine. Set it to False to keep the group at one sender (actor rank 0) plus the rollout workers.
     """
 
     def __init__(
@@ -222,7 +220,7 @@ class XCCLCheckpointEngine(CheckpointEngine):
         rebuild_group: bool = False,
         is_master: bool = False,
         rollout_dtype: torch.dtype = torch.bfloat16,
-        multi_sender: bool = False,
+        multi_sender: bool = True,
     ) -> None:
         self.bucket_size = bucket_size
         self.group_name = group_name
