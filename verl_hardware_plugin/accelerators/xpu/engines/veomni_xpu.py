@@ -13,6 +13,7 @@ force SUM + manual division on every FSDP2 module after initialization.
 No core code is patched; this is ordinary subclassing.
 """
 
+import functools
 import importlib
 import logging
 import os
@@ -25,6 +26,31 @@ except ModuleNotFoundError:
     # same functions); verl main still imports the old path. Alias it so the unmodified
     # core engine module imports against VeOmni main.
     sys.modules["veomni.models.checkpoint_tensor_loading"] = importlib.import_module("veomni.models.checkpoint.convert")
+
+def _use_xpu_hub_flash_kernel_version() -> None:
+    """Point VeOmni's hub FlashAttention loader at a hub major version that has an XPU build.
+
+    VeOmni hardcodes ``get_kernel(repo, version=1)`` for ``veomni_flash_attention_2_hub``;
+    kernels-community/flash-attn2 v1/v2 have no build for current torch XPU wheels, while v3
+    does (verified on torch 2.14.0+xpu, kernels 0.16.2). Select it with
+    ``veomni_flash_attention_2_hub``; override the major version with VERL_XPU_FA2_KERNEL_VERSION.
+    """
+    try:
+        import veomni.ops.install as veomni_install
+        from kernels import get_kernel
+    except ImportError:
+        return
+
+    version = int(os.getenv("VERL_XPU_FA2_KERNEL_VERSION", "3"))
+
+    @functools.lru_cache(maxsize=None)
+    def _load_hub_flash_kernel(repository: str):
+        return get_kernel(repository, version=version)
+
+    veomni_install._load_hub_flash_kernel = _load_hub_flash_kernel
+
+
+_use_xpu_hub_flash_kernel_version()
 
 from verl.workers.engine.base import EngineRegistry  # noqa: E402
 from verl.workers.engine.veomni.transformer_impl import VeOmniEngineWithLMHead, VeOmniEngineWithValueHead  # noqa: E402
