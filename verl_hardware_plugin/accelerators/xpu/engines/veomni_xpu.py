@@ -50,7 +50,48 @@ def _use_xpu_hub_flash_kernel_version() -> None:
     veomni_install._load_hub_flash_kernel = _load_hub_flash_kernel
 
 
+def _register_xpu_hub_flash_attention() -> None:
+    """Register VeOmni's hub FlashAttention2 rows for the ``xpu`` device.
+
+    VeOmni's op registry is keyed by (op, variant, impl, device) and only registers the hub
+    FA2 adapter for ``cuda``, so ``veomni_flash_attention_2_hub`` fails to resolve on XPU even
+    though the adapter itself is device-agnostic (it calls the hub kernel's varlen functions).
+    Re-register the existing wrapper under an XPU requirement.
+    """
+    try:
+        import torch
+        from veomni.ops import registry as veomni_registry
+    except ImportError:
+        return
+
+    class _XpuKernelRequirement:
+        device = "xpu"
+
+        def matches(self) -> bool:
+            return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+        def check(self) -> None:
+            if not self.matches():
+                raise RuntimeError("XpuKernelRequirement is not satisfied (no XPU device)")
+
+    registry = veomni_registry.OP_REGISTRY
+    for impl in ("flash_attention_2_hub", "veomni_flash_attention_2_hub"):
+        cuda_entry = registry._entries.get(("attention", "standard", impl, "cuda"))
+        if cuda_entry is None or ("attention", "standard", impl, "xpu") in registry._entries:
+            continue
+        veomni_registry.register_op(
+            "attention",
+            "standard",
+            impl,
+            description=f"{cuda_entry.description} (XPU)",
+            wrapper=cuda_entry.wrapper,
+            requirement=_XpuKernelRequirement(),
+            requires=("kernels",),
+        )
+
+
 _use_xpu_hub_flash_kernel_version()
+_register_xpu_hub_flash_attention()
 
 from verl.workers.engine.base import EngineRegistry  # noqa: E402
 from verl.workers.engine.veomni.transformer_impl import VeOmniEngineWithLMHead, VeOmniEngineWithValueHead  # noqa: E402
