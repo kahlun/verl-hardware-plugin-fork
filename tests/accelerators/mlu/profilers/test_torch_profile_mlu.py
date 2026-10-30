@@ -140,4 +140,3 @@ def test_mlu_patch_is_inert_off_mlu(off_mlu_platform, tmp_path, device_name):
         with mock.patch("torch.profiler.profile") as expected:
             core(contents=contents, save_path=str(tmp_path), rank=0)
         assert patched.call_args.kwargs["activities"] == expected.call_args.kwargs["activities"], contents
-
