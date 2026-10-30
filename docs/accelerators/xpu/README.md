@@ -1,6 +1,6 @@
 # Intel XPU User Guide
 
-Last updated: 10/15/2026.
+Last updated: 10/30/2026.
 
 ## Introduction
 

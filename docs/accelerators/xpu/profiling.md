@@ -1,6 +1,6 @@
 # Intel VTune Profiling Guide
 
-Last updated: 10/15/2026.
+Last updated: 10/30/2026.
 
 This guide describes Intel VTune (ITT) profiling support in `verl-hardware-plugin`
 for Intel XPU. There is no PyTorch-native profiler activity for Intel XPU, so

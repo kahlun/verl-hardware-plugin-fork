@@ -32,26 +32,39 @@ plugin-side monkeypatch over `torch.distributed.all_reduce`
 
 ## 1. Install verl and verl-hardware-plugin
 
-Pick one. Both install the same set of packages (torch 2.13.0+xpu, vLLM 0.29.0+xpu, transformers 5.17.0): the Docker
+Pick one. Both install the same set of packages (torch 2.14.0+xpu, vLLM 0.32.0+xpu, transformers 5.16.1): the Docker
 image runs the commands of Option B.
 
 ### Option A: Docker (recommended)
 
-The image is built from `docker/xpu/` in verl-core. It installs verl and this plugin together, so nothing else is
-needed. Pin the two checkouts with `--build-arg VERL_REF=<commit> --build-arg PLUGIN_REF=<commit>`; for release builds
-add `--no-cache` so the system certificates, `pip`, `certifi` and `uv` are fetched fresh.
+The image is [`docker/xpu/Dockerfile.stable.vllm`](https://github.com/verl-project/verl/blob/main/docker/xpu/Dockerfile.stable.vllm)
+in verl-core. It installs verl and this plugin together, so nothing else is needed. Pin the two checkouts with
+`--build-arg VERL_REF=<commit> --build-arg PLUGIN_REF=<commit>`; for release builds add `--no-cache` so the system
+certificates, `pip`, `certifi` and `uv` are fetched fresh.
 
 ```bash
 git clone https://github.com/verl-project/verl.git && cd verl
-docker build -f docker/xpu/Dockerfile.stable.vllm -t verl:xpu-vllm029 .
-docker run --rm -it --device /dev/dri --ipc=host --privileged verl:xpu-vllm029
+docker build -f docker/xpu/Dockerfile.stable.vllm -t verl:xpu-vllm032 .
+docker run --rm -it --device /dev/dri --ipc=host --privileged verl:xpu-vllm032
 ```
+
+The image is built in stages (`drivers` -> `runtime-base` -> `builder` -> `runtime`); only the finished `/opt/venv` and
+the verl / plugin checkouts (`/opt/verl`, `/opt/verl-hardware-plugin`) are shipped. It contains:
+
+- the Intel GPU user-mode driver (compute-runtime 26.27, IGC 2.38.2, Level Zero 1.32), matching vLLM 0.32.0's XPU image;
+- gcc/g++ and the Python headers, `ffmpeg`, `libnuma-dev` and `libze-dev` (see the system packages under Option B);
+- `CCL_SYCL_ALLGATHERV_TMP_BUF`, `CCL_SYCL_ALLREDUCE_TMP_BUF`, `CCL_SYCL_REDUCE_SCATTER_TMP_BUF` and
+  `CCL_SYCL_BROADCAST_TMP_BUF`, all set to `1`: they stop oneCCL from caching IPC handles of freed buffers, which
+  leaked host memory on multi-GPU runs. Set them yourself when you install from source.
+
+The build needs a verl checkout whose `requirements.txt` allows transformers >= 5.16.1 (verl `main` since PR #8390).
+An older `VERL_REF` is rejected by a check at the end of the build.
 
 ### Option B: From source
 
 verl pins its own versions, and `pip install -e .` on a verl checkout can replace the XPU build of torch with a
 different one (it also moves `transformers` and `tensordict` to verl's pins). Install the dependencies as below and
-add verl and the plugin with `--no-deps`.
+add verl and the plugin with `--no-deps`. The Dockerfile above is the reference for these steps.
 
 System packages on the host: `g++`/`gcc` and the Python 3.12 headers (Triton compiles its launcher stubs at first
 use), `libnuma-dev`, `libze-dev` (it provides the unversioned `libze_loader.so` that oneCCL opens; without it `xccl`
@@ -63,21 +76,23 @@ video).
 uv venv --python 3.12 --seed /opt/venv && source /opt/venv/bin/activate
 export UV_INDEX_URL=https://download.pytorch.org/whl/xpu UV_EXTRA_INDEX_URL=https://pypi.org/simple \
        UV_INDEX_STRATEGY=unsafe-best-match VLLM_TARGET_DEVICE=xpu
+export CCL_SYCL_ALLGATHERV_TMP_BUF=1 CCL_SYCL_ALLREDUCE_TMP_BUF=1 \
+       CCL_SYCL_REDUCE_SCATTER_TMP_BUF=1 CCL_SYCL_BROADCAST_TMP_BUF=1
 
 # vLLM XPU wheel (the PyPI wheel has no XPU kernels). --extra-index-url on the command line replaces
 # UV_EXTRA_INDEX_URL, so PyPI is repeated.
-uv pip install "vllm==0.29.0+xpu" \
-    --extra-index-url https://wheels.vllm.ai/0.29.0/xpu --extra-index-url https://wheels.vllm.ai/xpu \
+uv pip install "vllm==0.32.0+xpu" \
+    --extra-index-url https://wheels.vllm.ai/0.32.0/xpu --extra-index-url https://wheels.vllm.ai/xpu \
     --extra-index-url https://pypi.org/simple
 
 git clone https://github.com/verl-project/verl.git && cd verl
-grep -v '^transformers' requirements.txt > /tmp/requirements-core.txt
 echo 'pyzes>=0.1.2' > /tmp/override-pyzes.txt   # torch pins pyzes==0.1.1; the device-memory query needs >= 0.1.2
 
 # --no-config: run inside a verl checkout, uv would otherwise read verl's pyproject [tool.uv] overrides
-# (transformers 5.12.1, kernels<0.15 for the CUDA stack) and they would beat the XPU pins below.
-uv --no-config pip install -r /tmp/requirements-core.txt \
-    "torch==2.13.0+xpu" "transformers==5.17.0" "kernels>=0.16.0,<0.17.0" \
+# (for the CUDA stack) and they would beat the XPU pins below. transformers is not pinned: it comes from verl's
+# requirements.txt window and vLLM's (>= 5.16.1), and the [kernels] extra brings the matching kernels release.
+uv --no-config pip install -r requirements.txt \
+    "torch==2.14.0+xpu" "transformers[kernels]" \
     dpctl "pyzes>=0.1.2" triton-xpu "pip>=26.2.2" "certifi>=2026.10.19" qwen_vl_utils mathruler \
     --override /tmp/override-pyzes.txt
 uv --no-config pip install --no-deps -e .

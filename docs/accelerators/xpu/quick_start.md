@@ -98,7 +98,7 @@ timing_per_token_ms/gen: ~1.0    perf/max_memory_allocated_gb: ~9.2
 ```
 
 (Three runs on 2026-10-21 to 2026-10-23: vLLM 0.29.0+xpu, torch 2.13.0+xpu, this plugin at `e5ab532`, verl `main` at
-different commits. Timings vary with the stack and the host.)
+different commits; a 1-GPU rerun on vLLM 0.32.0+xpu, torch 2.14.0+xpu gave the same step times. Timings vary with the stack and the host.)
 
 Two GPUs: set `ZE_AFFINITY_MASK=0,1`, `trainer.n_gpus_per_node=2` and `+ray_kwargs.ray_init.num_gpus=2`, and keep
 everything else the same. At this small batch the step time does not drop, because fixed per-step overhead dominates.
@@ -127,7 +127,7 @@ Intel GPU attached.
 | Inference engine | vLLM validated | SGLang: `update_weights` — Work in Progress |
 | Trainer backend | FSDP, FSDP2 | Megatron — Work in Progress |
 | Algorithms | GRPO, PPO, SFT | Validated on GSM8K / Qwen2.5 |
-| Hardware (1-GPU) | Validated | Arc Pro B60: ~8 s/step steady state, ~450 tok/s (batch 16, Qwen2.5-0.5B, vLLM 0.29.0) |
+| Hardware (1-GPU) | Validated | Arc Pro B60: ~8 s/step steady state, ~450 tok/s (batch 16, Qwen2.5-0.5B, vLLM 0.29.0 and 0.32.0) |
 | Hardware (2-GPU) | Validated | Arc Pro B60 x2: ~8 s/step steady state at the same batch (~235 tok/s per GPU); FSDP2 and sleep mode also run |
 | Multi-node | Work in Progress | Two-node collectives work only with `CCL_ENABLE_SYCL_KERNELS=0` (then `ReduceOp.AVG` is unavailable); with oneCCL defaults a 64 MiB `all_reduce` across nodes hangs. A multi-node verl training run is not validated |
 | Profiler | Intel VTune (ITT) — Validated | `profiler_markers()` hook merged into verl-core `main` on 2026-10-08; VTune collector capture itself still untested, see [profiling.md](./profiling.md) |
