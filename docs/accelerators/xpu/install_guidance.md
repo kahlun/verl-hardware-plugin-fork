@@ -69,13 +69,15 @@ add verl and the plugin with `--no-deps`. The Dockerfile above is the reference 
 System packages on the host: `g++`/`gcc` and the Python 3.12 headers (Triton compiles its launcher stubs at first
 use), `libnuma-dev`, `libze-dev` (it provides the unversioned `libze_loader.so` that oneCCL opens; without it `xccl`
 fails with "ze_data was not initialized"), and `ffmpeg` (the FFmpeg shared libraries that `torchcodec` needs to decode
-video).
+video). The Docker image also installs `libhwloc15`, `libpciaccess0`, `libigsc1` and `intel-metrics-library` (from
+Intel's `ppa:kobuk-team/intel-graphics`) for the Sysman PCI/NUMA query that pyzes makes; install them as well.
 
 ```bash
 # Use pip >= 26.2.2 and uv >= 0.13.4 (both carry the corrected CA bundle).
 uv venv --python 3.12 --seed /opt/venv && source /opt/venv/bin/activate
 export UV_INDEX_URL=https://download.pytorch.org/whl/xpu UV_EXTRA_INDEX_URL=https://pypi.org/simple \
        UV_INDEX_STRATEGY=unsafe-best-match VLLM_TARGET_DEVICE=xpu
+export LD_LIBRARY_PATH=/opt/venv/lib:/usr/local/lib   # without it oneCCL fails: "could not load any plugin"
 export CCL_SYCL_ALLGATHERV_TMP_BUF=1 CCL_SYCL_ALLREDUCE_TMP_BUF=1 \
        CCL_SYCL_REDUCE_SCATTER_TMP_BUF=1 CCL_SYCL_BROADCAST_TMP_BUF=1
 
