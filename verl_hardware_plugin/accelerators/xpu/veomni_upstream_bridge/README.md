@@ -28,6 +28,11 @@ lands, not only on a flag day.
 
 `helper.py` profiler / full-determinism / `num_alloc_retries` branches (VeOmni's own
 trainer only), `init_device` Literal widening (type hints), `train.sh`, docs, CI.
+Single-process runs (world size 1, no FSDP) are NOT bridged: stock VeOmni's `build_parallelize_model`
+rejects any `init_device` outside `cuda/npu/mlu` when FSDP is off (an inline list that #1387 extends with
+`xpu`). Verified on CRI 2026-11-12: world size 1 fails with "Only FSDP training supports `init_device=meta`".
+Use >= 2 ranks until #1387 lands.
+
 Running VeOmni's own trainer (not through verl) on XPU needs #1387 itself.
 
 ## Verifying the bridge against stock VeOmni
