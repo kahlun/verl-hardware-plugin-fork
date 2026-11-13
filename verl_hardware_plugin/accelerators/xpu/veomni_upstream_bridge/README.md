@@ -14,6 +14,8 @@ lands, not only on a flag day.
 |---|---|---|---|
 | `device.py` | VeOmni reports `cpu` on XPU: no `IS_XPU_AVAILABLE`, `get_device_type()`, `get_dist_comm_backend()` (`xccl`), `stream_synchronize()`, and `helper.empty_cache()` skips XPU | [VeOmni#1387](https://github.com/ByteDance-Seed/VeOmni/pull/1387) (OPEN, review required) | verl's pinned VeOmni contains #1387 |
 | `hub_fa2.py` | Ulysses SP on XPU: hub FA2 kernel major version, and `OP_REGISTRY` rows for `xpu` | VeOmni hub-FA2-on-XPU change (not yet submitted; branch `feat/xpu-hub-flash-attention`, patch `veomni_xpu_hub_fa2.patch`) | VeOmni has an `xpu` row in `_FA2_HUB_ROWS` and `_hub_flash_kernel_version` |
+| `parallelize.py` | Single-process (no FSDP) path: `build_parallelize_model` rejects `init_device=xpu` | VeOmni#1387 (same PR) | verl's pinned VeOmni contains #1387 |
+| `float8.py` (opt-in `VERL_XPU_VEOMNI_FLOAT8=tensorwise`) | torchao float8 training on XPU: converts Linear layers, makes VeOmni's fused SwiGLU MLP respect `Float8Linear`, pads the token dim to a multiple of 16 | [VeOmni#1364](https://github.com/ByteDance-Seed/VeOmni/pull/1364) (draft, NVIDIA SM89+ only, rejects compile) | VeOmni float8 accepts XPU |
 | `checkpoint_alias.py` | verl main imports `veomni.models.checkpoint_tensor_loading`; VeOmni moved it to `checkpoint.convert` | [VeOmni#1142](https://github.com/ByteDance-Seed/VeOmni/pull/1142). This one is a verl/VeOmni version skew, not XPU | verl updates the import |
 
 ## How to remove
@@ -24,15 +26,16 @@ lands, not only on a flag day.
    `engines/veomni_xpu.py`.
 4. Run the VeOmni SFT/GRPO smoke on XPU (see "Verifying" below).
 
+## Float8 status (opt-in, experimental)
+
+Verified only eager, 2 ranks FSDP2 on CRI (Qwen2.5-1.5B SFT): loss tracks bf16, step time is slower (~27% at ~9k
+tokens per card). Compile and the FSDP2 float8 all-gather are not validated. `parallelize.py` is covered by a CPU
+unit test only; the single-rank path has not yet been run on hardware.
+
 ## Not bridged (VeOmni#1387 has these, verl's engine path does not use them)
 
 `helper.py` profiler / full-determinism / `num_alloc_retries` branches (VeOmni's own
 trainer only), `init_device` Literal widening (type hints), `train.sh`, docs, CI.
-Single-process runs (world size 1, no FSDP) are NOT bridged: stock VeOmni's `build_parallelize_model`
-rejects any `init_device` outside `cuda/npu/mlu` when FSDP is off (an inline list that #1387 extends with
-`xpu`). Verified on CRI 2026-11-12: world size 1 fails with "Only FSDP training supports `init_device=meta`".
-Use >= 2 ranks until #1387 lands.
-
 Running VeOmni's own trainer (not through verl) on XPU needs #1387 itself.
 
 ## Verifying the bridge against stock VeOmni

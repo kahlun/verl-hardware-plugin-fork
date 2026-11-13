@@ -64,6 +64,23 @@ def _release_xpu_cache_if_bloated() -> None:
         torch.xpu.empty_cache()
 
 
+def _cap_xpu_memory_fraction() -> None:
+    """Cap this process's XPU caching allocator at a fraction of the card (opt-in).
+
+    The xe driver never fails an over-commit, so the allocator never takes its free-cached-and-retry
+    path: reserved memory grows with each distinct micro-batch length until Level Zero raises
+    UR_RESULT_ERROR_OUT_OF_RESOURCES. A per-process fraction makes the allocator release cached
+    blocks at the cap. Alternative to the cache trimming above, from the CRI Qwen3.5 GRPO runs
+    (not yet compared against it on VeOmni). Set VERL_XPU_MEM_FRACTION=0.85 to enable; unset = off.
+    """
+    value = os.getenv("VERL_XPU_MEM_FRACTION")
+    if not value or float(value) <= 0:
+        return
+    import torch
+
+    torch.xpu.set_per_process_memory_fraction(float(value))
+
+
 def _log_xpu_memory(tag: str) -> None:
     """Print device memory usage when VERL_XPU_MEMLOG=1 (debugging aid)."""
     if os.getenv("VERL_XPU_MEMLOG") != "1":
@@ -106,6 +123,7 @@ class VeOmniXPUEngineWithLMHead(VeOmniEngineWithLMHead):
         return out
 
     def initialize(self):
+        _cap_xpu_memory_fraction()
         super().initialize()
         _force_sum_reduction_on_all_fsdp_modules(self.module)
 

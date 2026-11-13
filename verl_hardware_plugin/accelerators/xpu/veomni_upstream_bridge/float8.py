@@ -1,0 +1,102 @@
+# Copyright (c) 2026 BAAI. All rights reserved.
+# Licensed under the Apache License, Version 2.0.
+
+"""Opt-in torchao float8 training for the VeOmni engine on XPU (stand-in for VeOmni#1364).
+
+Delete this module once VeOmni's float8 support (#1364 and follow-ups) accepts XPU. Today #1364
+requires an NVIDIA SM89+ device and rejects ``torch.compile``.
+
+Enable with ``VERL_XPU_VEOMNI_FLOAT8=tensorwise`` (or ``rowwise``). Off by default.
+
+Status (CRI, Qwen2.5-1.5B SFT, 2 ranks FSDP2): eager float8 runs and tracks the bf16 loss but is
+slower than bf16 (about 27% at ~9k tokens per card); the compile path is not validated here, and
+the FSDP2 float8 all-gather is not wired. torchao float8 only pays off compiled with a large
+microbatch (see the CRI FP8 report).
+
+Three things this module handles that torchao alone does not:
+
+1. ``convert_to_float8_training`` runs on the model VeOmni builds, before FSDP2 wraps it.
+2. VeOmni's fused SwiGLU MLP reads ``gate/up/down_proj.weight`` directly when the projections are
+   ``isinstance(..., nn.Linear)``. ``Float8Linear`` is a subclass, so the MLP would bypass its float8
+   forward and silently stay bf16. The plain-projection check is swapped to require the exact type
+   (VeOmni#1364 makes the same change).
+3. The float8 GEMM needs the token (contraction) dimension divisible by 16, and verl packs
+   variable-length sequences. ``Float8Linear.forward`` pads the flattened token dim with zero rows and
+   slices the output back; zero rows change neither the output nor the weight gradient.
+"""
+
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+ENV = "VERL_XPU_VEOMNI_FLOAT8"
+_CALLS = [0]  # Float8Linear forward calls, for verifying float8 actually executes
+
+
+def _plain_projections_donor(mlp):  # code donor: `nn` resolves in veomni's swiglu_mlp module globals
+    return all(type(getattr(mlp, name)) is nn.Linear for name in ("gate_proj", "up_proj", "down_proj"))  # noqa: F821
+
+
+def calls() -> int:
+    """Number of Float8Linear forward calls so far in this process."""
+    return _CALLS[0]
+
+
+def _pad_token_dim(float8_linear_cls) -> None:
+    import torch.nn.functional as F
+
+    if getattr(float8_linear_cls, "_xpu_pad16", False):
+        return
+    orig_forward = float8_linear_cls.forward
+
+    def forward(self, x):
+        _CALLS[0] += 1
+        lead = x.shape[:-1]
+        tokens = x.reshape(-1, x.shape[-1])
+        n = tokens.shape[0]
+        padded = ((n + 15) // 16) * 16
+        y = orig_forward(self, F.pad(tokens, (0, 0, 0, padded - n)))[:n]
+        return y.reshape(*lead, y.shape[-1])
+
+    float8_linear_cls.forward = forward
+    float8_linear_cls._xpu_pad16 = True
+
+
+def _convert(model, recipe: str):
+    from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+    from torchao.float8.float8_linear import Float8Linear
+    from veomni.ops.kernels import swiglu_mlp
+
+    swiglu_mlp.has_plain_linear_projections.__code__ = _plain_projections_donor.__code__
+    _pad_token_dim(Float8Linear)
+    convert_to_float8_training(
+        model,
+        config=Float8LinearConfig.from_recipe_name(recipe),
+        module_filter_fn=lambda mod, fqn: (
+            "lm_head" not in fqn and mod.in_features % 16 == 0 and mod.out_features % 16 == 0
+        ),
+    )
+    n = sum(type(m).__name__ == "Float8Linear" for m in model.modules())
+    logger.warning("float8 training: converted %d Linear -> Float8Linear (recipe=%s)", n, recipe)
+    return model
+
+
+def apply() -> None:
+    recipe = os.getenv(ENV, "")
+    if not recipe:
+        return
+    try:
+        import verl.workers.engine.veomni.transformer_impl as engine_impl
+    except ImportError:
+        return
+    if getattr(engine_impl, "_xpu_float8_applied", False):
+        return
+
+    orig_build = engine_impl.build_foundation_model
+
+    def build_foundation_model(*args, **kwargs):
+        return _convert(orig_build(*args, **kwargs), recipe)
+
+    engine_impl.build_foundation_model = build_foundation_model
+    engine_impl._xpu_float8_applied = True
