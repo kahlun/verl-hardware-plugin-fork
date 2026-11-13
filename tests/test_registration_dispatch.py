@@ -17,6 +17,13 @@ import pytest
 @pytest.fixture
 def plugin():
     """Load the actual root entry point, initially suppressing backend imports."""
+    # Registration modules lazily ``import torch`` (e.g. ROCm ``_is_rocm``, the MLU profiler). Import it before any
+    # ``patch.dict(sys.modules)`` below: a first import made inside it is rolled back on exit and the next real
+    # torch import then fails or segfaults.
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        pass
     path = Path(__file__).resolve().parents[1] / "verl_hardware_plugin" / "__init__.py"
     spec = importlib.util.spec_from_file_location("verl_hardware_plugin", path)
     package = importlib.util.module_from_spec(spec)
