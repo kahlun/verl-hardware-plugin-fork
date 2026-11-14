@@ -26,6 +26,25 @@ lands, not only on a flag day.
    `engines/veomni_xpu.py`.
 4. Run the VeOmni SFT/GRPO smoke on XPU (see "Verifying" below).
 
+## Verified results (stock VeOmni main `95f93e3`, 2026-11-12/14)
+
+| Setup | Result |
+|---|---|
+| B60, 2 ranks: SFT with FSDP2 baseline, VeOmni SDPA, VeOmni hub-FA2 + Ulysses SP=2 | all rc=0; loss within ~0.002 of FSDP2 per step |
+| B60, 2 ranks: GRPO with FSDP2, VeOmni SDPA, VeOmni SP=2 | all rc=0; ppo_kl ~1e-4, mismatch and response length match FSDP2 |
+| CRI, 2 ranks: SFT bf16 eager and compiled decoder layers | rc=0, losses identical to ~1e-3 |
+| CRI, 2 ranks: GRPO with VeOmni vs FSDP2 (Qwen2.5-0.5B, 3 steps) | both rc=0; mismatch 0.0039-0.0046 vs 0.0042-0.0047, step time 32/14/14 s vs 31/13.5/13.5 s. Reward was 0.0 in every step, so this shows the engine runs and tracks FSDP2, not that it learns |
+| With the bridge disabled (`VERL_XPU_VEOMNI_BRIDGE=0`) | `Unknown backend: veomni` (engine cannot even register) |
+
+Requirement on the CRI image (CRI_main_2675_ww44.2): VeOmni GRPO needs `transformers==5.17.0` and
+`tokenizers>=0.23.1` (installed `--no-deps`); the image's 5.14.1 fails in `create_causal_mask`
+(`allow_is_causal_skip`). The SFT path did not hit it.
+
+Float8 (opt-in, `float8.py`), CRI 2 ranks, Qwen2.5-1.5B SFT, ~9k tokens per card: eager and compiled float8
+run and track the bf16 loss (step 10: 0.3834 bf16 vs 0.3897 float8 vs 0.3845 float8 all-gather) but are
+slower than bf16 (~26% compiled, noisy timings on a shared node). With gradient checkpointing on, compiled
+float8 raises `CheckpointError` (not resolved here).
+
 ## Float8 status (opt-in, experimental)
 
 Verified only eager, 2 ranks FSDP2 on CRI (Qwen2.5-1.5B SFT): loss tracks bf16, step time is slower (~27% at ~9k
