@@ -33,6 +33,7 @@ lands, not only on a flag day.
 | B60, 2 ranks: GRPO with FSDP2, VeOmni SDPA, VeOmni SP=2 | all rc=0; ppo_kl ~1e-4, mismatch and response length match FSDP2 |
 | CRI, 2 ranks: SFT bf16 eager and compiled decoder layers | rc=0, losses identical to ~1e-3 |
 | CRI, 2 ranks: GRPO with VeOmni vs FSDP2 (Qwen2.5-0.5B, 3 steps) | both rc=0; mismatch 0.0039-0.0046 vs 0.0042-0.0047, step time 32/14/14 s vs 31/13.5/13.5 s. Reward was 0.0 in every step, so this shows the engine runs and tracks FSDP2, not that it learns |
+| CRI, 2 ranks: GRPO with a moving reward (Qwen2.5-1.5B-Instruct, bs32 n8 resp512, lr 5e-6, 8 steps; last ~5 steps captured in the summary) | both rc=0. score/mean FSDP2 0.14 -> 0.51 -> 0.71 -> 0.71 -> 0.70, VeOmni 0.11 -> 0.56 -> 0.72 -> 0.68 -> 0.70; rollout-vs-trainer mismatch ~0.0032 both; grad_norm 0.55-0.96 both; step time 42-71 s (FSDP2) vs 48-76 s (VeOmni, noisier) |
 | With the bridge disabled (`VERL_XPU_VEOMNI_BRIDGE=0`) | `Unknown backend: veomni` (engine cannot even register) |
 
 Requirement on the CRI image (CRI_main_2675_ww44.2): VeOmni GRPO needs `transformers==5.17.0` and
