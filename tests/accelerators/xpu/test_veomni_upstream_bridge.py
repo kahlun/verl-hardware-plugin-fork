@@ -11,7 +11,6 @@ import importlib.util
 import sys
 import types
 
-import pytest
 import torch
 
 
@@ -100,35 +99,3 @@ def test_bridge_skipped_when_veomni_absent(monkeypatch):
     from verl_hardware_plugin.accelerators.xpu.veomni_upstream_bridge import device as bridge
 
     bridge.apply()  # must not raise
-
-
-def test_parallelize_bridge_widens_init_device_list(monkeypatch, tmp_path):
-    """The non-FSDP init_device list is a literal in the function body; the bridge recompiles it."""
-    src = (
-        "def build_parallelize_model(init_device, fsdp):\n"
-        "    if not fsdp:\n"
-        '        if init_device not in ["cuda", "npu", "mlu"]:\n'
-        '            raise ValueError("Only FSDP training supports `init_device=meta`.")\n'
-        "    return init_device\n"
-    )
-    path = tmp_path / "torch_parallelize.py"
-    path.write_text(src)
-    spec = importlib.util.spec_from_file_location("veomni.distributed.torch_parallelize", path)
-    tp = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(tp)
-    pkg = types.ModuleType("veomni")
-    dist = types.ModuleType("veomni.distributed")
-    dist.torch_parallelize = tp
-    for name, mod in (("veomni", pkg), ("veomni.distributed", dist), ("veomni.distributed.torch_parallelize", tp)):
-        monkeypatch.setitem(sys.modules, name, mod)
-    by_name = tp.build_parallelize_model  # a caller that imported the function by name
-    with pytest.raises(ValueError):
-        by_name("xpu", fsdp=False)
-
-    from verl_hardware_plugin.accelerators.xpu.veomni_upstream_bridge import parallelize as bridge
-
-    bridge.apply()
-    assert by_name("xpu", fsdp=False) == "xpu"
-    with pytest.raises(ValueError):
-        by_name("meta", fsdp=False)  # unrelated values are still rejected
-    bridge.apply()  # idempotent

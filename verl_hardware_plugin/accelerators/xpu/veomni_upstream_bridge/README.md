@@ -14,7 +14,6 @@ lands, not only on a flag day.
 |---|---|---|---|
 | `device.py` | VeOmni reports `cpu` on XPU: no `IS_XPU_AVAILABLE`, `get_device_type()`, `get_dist_comm_backend()` (`xccl`), `stream_synchronize()`, and `helper.empty_cache()` skips XPU | [VeOmni#1387](https://github.com/ByteDance-Seed/VeOmni/pull/1387) (OPEN, review required) | verl's pinned VeOmni contains #1387 |
 | `hub_fa2.py` | Ulysses SP on XPU: hub FA2 kernel major version, and `OP_REGISTRY` rows for `xpu` | VeOmni hub-FA2-on-XPU change (not yet submitted; branch `feat/xpu-hub-flash-attention`, patch `veomni_xpu_hub_fa2.patch`) | VeOmni has an `xpu` row in `_FA2_HUB_ROWS` and `_hub_flash_kernel_version` |
-| `parallelize.py` | Single-process (no FSDP) path: `build_parallelize_model` rejects `init_device=xpu` | VeOmni#1387 (same PR) | verl's pinned VeOmni contains #1387 |
 | `float8.py` (opt-in `VERL_XPU_VEOMNI_FLOAT8=tensorwise`) | torchao float8 training on XPU: converts Linear layers, makes VeOmni's fused SwiGLU MLP respect `Float8Linear`, pads the token dim to a multiple of 16 | [VeOmni#1364](https://github.com/ByteDance-Seed/VeOmni/pull/1364) (draft, NVIDIA SM89+ only, rejects compile) | VeOmni float8 accepts XPU |
 | `checkpoint_alias.py` | verl main imports `veomni.models.checkpoint_tensor_loading`; VeOmni moved it to `checkpoint.convert` | [VeOmni#1142](https://github.com/ByteDance-Seed/VeOmni/pull/1142). This one is a verl/VeOmni version skew, not XPU | verl updates the import |
 
@@ -48,8 +47,13 @@ float8 raises `CheckpointError` (not resolved here).
 ## Float8 status (opt-in, experimental)
 
 Verified only eager, 2 ranks FSDP2 on CRI (Qwen2.5-1.5B SFT): loss tracks bf16, step time is slower (~27% at ~9k
-tokens per card). Compile and the FSDP2 float8 all-gather are not validated. `parallelize.py` is covered by a CPU
-unit test only; the single-rank path has not yet been run on hardware.
+tokens per card). Compile and the FSDP2 float8 all-gather are not validated. 
+## Single-rank runs: not supported (any hardware)
+
+verl's VeOmni engine hardcodes `data_parallel_mode="fsdp2"`, and VeOmni asserts `init_device="meta"` for FSDP2, but at
+world size 1 FSDP is off and VeOmni's non-FSDP branch rejects `meta`. Verified on B60: `init_device=meta` fails with "Only FSDP
+training supports init_device=meta"; `init_device=xpu` fails with "Please use model.accelerator.init_device: meta for FSDP2
+training". Use 2 or more ranks. (A bridge for the non-FSDP list was tried and removed: it cannot help through verl.)
 
 ## Not bridged (VeOmni#1387 has these, verl's engine path does not use them)
 
