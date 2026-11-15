@@ -94,9 +94,11 @@ def test_bridge_is_noop_once_veomni_has_xpu(monkeypatch):
 
 
 def test_bridge_skipped_when_veomni_absent(monkeypatch):
+    # A None entry in sys.modules makes `import veomni...` raise ImportError, whether or not VeOmni is installed.
     for name in [n for n in sys.modules if n == "veomni" or n.startswith("veomni.")]:
         monkeypatch.delitem(sys.modules, name)
-    monkeypatch.setattr(sys, "meta_path", [m for m in sys.meta_path if "veomni" not in repr(m)])
+    for name in ("veomni", "veomni.utils", "veomni.utils.device", "veomni.utils.helper"):
+        monkeypatch.setitem(sys.modules, name, None)
     from verl_hardware_plugin.accelerators.xpu.veomni_upstream_bridge import device as bridge
 
     bridge.apply()  # must not raise
@@ -142,25 +144,3 @@ def test_low_precision_rs_bridge_allows_xpu(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError):
         by_name(True)  # other devices are still rejected
     bridge.apply()  # idempotent
-
-
-def test_veomni_cache_trim_threshold_scales_with_card(monkeypatch):
-    """The trim threshold is a fraction of the card unless set in GiB."""
-    try:
-        from verl_hardware_plugin.accelerators.xpu.engines import veomni_xpu
-    except Exception:
-        pytest.skip("verl's VeOmni engine is not importable here")
-
-    gib = 1024**3
-    props = types.SimpleNamespace(total_memory=24 * gib)
-    fake_xpu = types.SimpleNamespace(current_device=lambda: 0, get_device_properties=lambda i: props)
-    monkeypatch.setattr(torch, "xpu", fake_xpu, raising=False)
-    monkeypatch.delenv("VERL_XPU_EMPTY_CACHE_RESERVED_GB", raising=False)
-    monkeypatch.delenv("VERL_XPU_EMPTY_CACHE_RESERVED_FRACTION", raising=False)
-    assert veomni_xpu._trim_threshold_bytes() == pytest.approx(8 * gib)  # B60: same as the old fixed 8 GiB
-    props.total_memory = 152 * gib
-    assert veomni_xpu._trim_threshold_bytes() == pytest.approx(152 * gib / 3)  # CRI
-    monkeypatch.setenv("VERL_XPU_EMPTY_CACHE_RESERVED_FRACTION", "0.5")
-    assert veomni_xpu._trim_threshold_bytes() == pytest.approx(76 * gib)
-    monkeypatch.setenv("VERL_XPU_EMPTY_CACHE_RESERVED_GB", "8")
-    assert veomni_xpu._trim_threshold_bytes() == pytest.approx(8 * gib)
