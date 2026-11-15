@@ -142,3 +142,25 @@ def test_low_precision_rs_bridge_allows_xpu(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError):
         by_name(True)  # other devices are still rejected
     bridge.apply()  # idempotent
+
+
+def test_veomni_cache_trim_threshold_scales_with_card(monkeypatch):
+    """The trim threshold is a fraction of the card unless set in GiB."""
+    try:
+        from verl_hardware_plugin.accelerators.xpu.engines import veomni_xpu
+    except Exception:
+        pytest.skip("verl's VeOmni engine is not importable here")
+
+    gib = 1024**3
+    props = types.SimpleNamespace(total_memory=24 * gib)
+    fake_xpu = types.SimpleNamespace(current_device=lambda: 0, get_device_properties=lambda i: props)
+    monkeypatch.setattr(torch, "xpu", fake_xpu, raising=False)
+    monkeypatch.delenv("VERL_XPU_EMPTY_CACHE_RESERVED_GB", raising=False)
+    monkeypatch.delenv("VERL_XPU_EMPTY_CACHE_RESERVED_FRACTION", raising=False)
+    assert veomni_xpu._trim_threshold_bytes() == pytest.approx(8 * gib)  # B60: same as the old fixed 8 GiB
+    props.total_memory = 152 * gib
+    assert veomni_xpu._trim_threshold_bytes() == pytest.approx(152 * gib / 3)  # CRI
+    monkeypatch.setenv("VERL_XPU_EMPTY_CACHE_RESERVED_FRACTION", "0.5")
+    assert veomni_xpu._trim_threshold_bytes() == pytest.approx(76 * gib)
+    monkeypatch.setenv("VERL_XPU_EMPTY_CACHE_RESERVED_GB", "8")
+    assert veomni_xpu._trim_threshold_bytes() == pytest.approx(8 * gib)
