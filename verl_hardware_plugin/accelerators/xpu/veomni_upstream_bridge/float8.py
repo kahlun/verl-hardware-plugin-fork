@@ -22,9 +22,10 @@ Three things this module handles that torchao alone does not:
    ``isinstance(..., nn.Linear)``. ``Float8Linear`` is a subclass, so the MLP would bypass its float8
    forward and silently stay bf16. The plain-projection check is swapped to require the exact type
    (VeOmni#1364 makes the same change).
-3. The float8 GEMM needs the token (contraction) dimension divisible by 16, and verl packs
-   variable-length sequences. ``Float8Linear.forward`` pads the flattened token dim with zero rows and
-   slices the output back; zero rows change neither the output nor the weight gradient.
+3. The float8 GEMM needs its inner dimension divisible by 16; in the weight-gradient GEMM that is the token
+   count, which verl's packed variable-length batches do not round. By default ``Float8Linear.forward`` pads
+   the flattened token dim with zero rows and slices the output back (zero rows change neither the output nor
+   the weight gradient). ``VERL_XPU_VEOMNI_FLOAT8_PAD=torchao`` uses torchao's own ``pad_inner_dim`` instead.
 """
 
 import logging
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 ENV = "VERL_XPU_VEOMNI_FLOAT8"
 ALLGATHER_ENV = "VERL_XPU_VEOMNI_FLOAT8_ALLGATHER"
+PAD_ENV = "VERL_XPU_VEOMNI_FLOAT8_PAD"  # "hook" (default): pad tokens in Float8Linear.forward; "torchao": pad_inner_dim
 _CALLS = [0]  # Float8Linear forward calls, for verifying float8 actually executes
 
 
@@ -46,15 +48,18 @@ def calls() -> int:
     return _CALLS[0]
 
 
-def _pad_token_dim(float8_linear_cls) -> None:
+def _wrap_forward(float8_linear_cls, pad_tokens: bool) -> None:
+    """Count Float8Linear calls; with ``pad_tokens`` also pad the flattened token dim to a multiple of 16."""
     import torch.nn.functional as F
 
-    if getattr(float8_linear_cls, "_xpu_pad16", False):
+    if getattr(float8_linear_cls, "_xpu_wrapped", False):
         return
     orig_forward = float8_linear_cls.forward
 
     def forward(self, x):
         _CALLS[0] += 1
+        if not pad_tokens:
+            return orig_forward(self, x)
         lead = x.shape[:-1]
         tokens = x.reshape(-1, x.shape[-1])
         n = tokens.shape[0]
@@ -63,7 +68,7 @@ def _pad_token_dim(float8_linear_cls) -> None:
         return y.reshape(*lead, y.shape[-1])
 
     float8_linear_cls.forward = forward
-    float8_linear_cls._xpu_pad16 = True
+    float8_linear_cls._xpu_wrapped = True
 
 
 def _convert(model, recipe: str, all_gather: bool):
@@ -74,22 +79,29 @@ def _convert(model, recipe: str, all_gather: bool):
     from veomni.ops.kernels import swiglu_mlp
 
     swiglu_mlp.has_plain_linear_projections.__code__ = _plain_projections_donor.__code__
-    _pad_token_dim(Float8Linear)
+    pad = os.getenv(PAD_ENV, "hook")
+    if pad not in ("hook", "torchao"):
+        raise ValueError(f"{PAD_ENV} must be 'hook' or 'torchao', got {pad!r}")
+    _wrap_forward(Float8Linear, pad_tokens=pad == "hook")
+    config = dataclasses.replace(
+        Float8LinearConfig.from_recipe_name(recipe),
+        enable_fsdp_float8_all_gather=all_gather,
+        pad_inner_dim=pad == "torchao",
+    )
     convert_to_float8_training(
         model,
-        config=dataclasses.replace(
-            Float8LinearConfig.from_recipe_name(recipe), enable_fsdp_float8_all_gather=all_gather
-        ),
+        config=config,
         module_filter_fn=lambda mod, fqn: (
             "lm_head" not in fqn and mod.in_features % 16 == 0 and mod.out_features % 16 == 0
         ),
     )
     n = sum(type(m).__name__ == "Float8Linear" for m in model.modules())
     logger.warning(
-        "float8 training: converted %d Linear -> Float8Linear (recipe=%s, fsdp float8 all-gather=%s)",
+        "float8 training: converted %d Linear -> Float8Linear (recipe=%s, fsdp float8 all-gather=%s, pad=%s)",
         n,
         recipe,
         all_gather,
+        pad,
     )
     return model
 
