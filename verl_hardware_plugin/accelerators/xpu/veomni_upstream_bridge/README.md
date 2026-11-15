@@ -14,7 +14,9 @@ lands, not only on a flag day.
 |---|---|---|---|
 | `device.py` | VeOmni reports `cpu` on XPU: no `IS_XPU_AVAILABLE`, `get_device_type()`, `get_dist_comm_backend()` (`xccl`), `stream_synchronize()`, and `helper.empty_cache()` skips XPU | [VeOmni#1387](https://github.com/ByteDance-Seed/VeOmni/pull/1387) (OPEN, review required) | verl's pinned VeOmni contains #1387 |
 | `hub_fa2.py` | Ulysses SP on XPU: hub FA2 kernel major version, and `OP_REGISTRY` rows for `xpu` | VeOmni hub-FA2-on-XPU change (not yet submitted; branch `feat/xpu-hub-flash-attention`, patch `veomni_xpu_hub_fa2.patch`) | VeOmni has an `xpu` row in `_FA2_HUB_ROWS` and `_hub_flash_kernel_version` |
-| `float8.py` (opt-in `VERL_XPU_VEOMNI_FLOAT8=tensorwise`) | torchao float8 training on XPU: converts Linear layers, makes VeOmni's fused SwiGLU MLP respect `Float8Linear`, pads the token dim to a multiple of 16 | [VeOmni#1364](https://github.com/ByteDance-Seed/VeOmni/pull/1364) (draft, NVIDIA SM89+ only, rejects compile) | VeOmni float8 accepts XPU |
+| `float8.py` (opt-in `VERL_XPU_VEOMNI_FLOAT8=tensorwise`) | torchao float8 training on XPU: converts Linear layers, makes VeOmni's fused SwiGLU MLP respect `Float8Linear`, pads the token dim to a multiple of 16; `VERL_XPU_VEOMNI_FLOAT8_ALLGATHER=1` adds the FSDP2 float8 all-gather | [VeOmni#1364](https://github.com/ByteDance-Seed/VeOmni/pull/1364) (draft, NVIDIA SM89+ only, rejects compile) | VeOmni float8 accepts XPU |
+| `low_precision_rs.py` | VeOmni's BF16-transport / FP32-reduction ReduceScatter (`engine.low_precision_reduce_scatter_comm=True`) is device-agnostic but gated to CUDA; allows `xpu` | VeOmni#1167 added it with the CUDA gate; no XPU change upstream yet | VeOmni allows XPU there |
+| `compile_layers.py` (opt-in `VERL_XPU_VEOMNI_COMPILE=1`) | `torch.compile` of each decoder layer in place; VeOmni's own compile option raises "CUDA-only" | none yet | VeOmni's decoder-block compile accepts XPU |
 | `checkpoint_alias.py` | verl main imports `veomni.models.checkpoint_tensor_loading`; VeOmni moved it to `checkpoint.convert` | [VeOmni#1142](https://github.com/ByteDance-Seed/VeOmni/pull/1142). This one is a verl/VeOmni version skew, not XPU | verl updates the import |
 
 ## How to remove
@@ -40,15 +42,20 @@ Requirement on the CRI image (CRI_main_2675_ww44.2): VeOmni GRPO needs `transfor
 `tokenizers>=0.23.1` (installed `--no-deps`); the image's 5.14.1 fails in `create_causal_mask`
 (`allow_is_causal_skip`). The SFT path did not hit it.
 
-Float8 (opt-in, `float8.py`), CRI 2 ranks, Qwen2.5-1.5B SFT, ~9k tokens per card: eager and compiled float8
-run and track the bf16 loss (step 10: 0.3834 bf16 vs 0.3897 float8 vs 0.3845 float8 all-gather) but are
-slower than bf16 (~26% compiled, noisy timings on a shared node). With gradient checkpointing on, compiled
-float8 raises `CheckpointError` (not resolved here).
+## Low-precision status (CRI, 2 ranks, Qwen2.5-1.5B-Instruct, GSM8K; 2026-11-15)
 
-## Float8 status (opt-in, experimental)
+| Feature | Result |
+|---|---|
+| float8 SFT, eager (`float8.py`) | rc=0; loss 0.586 -> 0.470 vs bf16 0.568 -> 0.467 (10 steps) |
+| float8 SFT + FSDP2 float8 all-gather | rc=0; loss 0.586 -> 0.471; 392 Float8Linear calls before the first optimizer step |
+| float8 SFT, compiled (`compile_layers.py`), gradient checkpointing off | rc=0; loss 0.584 -> 0.475; compiled bf16 0.567 -> 0.467. Compiled float8 with checkpointing on raises `CheckpointError` |
+| low-precision ReduceScatter (`low_precision_rs.py`) | rc=0; "transport enabled for node-local shard group [0, 1]"; losses bit-identical to the default path (expected: gradients are bf16-valued and a 2-rank FP32 sum is exact). Speed not measured |
+| float8 GRPO (VeOmni actor + ref), 8 steps | rc=0; reward 0.14 -> 0.83 (bf16 0.10 -> 0.72); rollout-vs-trainer mismatch 0.012 vs 0.0033 for bf16 (actor in float8, rollout in bf16); 71-92 s/step vs 63 s |
+| float8 speed | slower than bf16 in every test (SFT ~26% compiled at ~9k tokens/card; GRPO ~30%). On B60 float8 matmul is 0.69x bf16 and a compiled float8 MLP 1.8x slower |
 
-Verified only eager, 2 ranks FSDP2 on CRI (Qwen2.5-1.5B SFT): loss tracks bf16, step time is slower (~27% at ~9k
-tokens per card). Compile and the FSDP2 float8 all-gather are not validated. 
+Note: verl's VeOmni engine config defaults `mixed_precision: true` (FP32 master weights, BF16 compute), so
+the "bf16" baseline above is already mixed precision.
+
 ## Single-rank runs: not supported (any hardware)
 
 verl's VeOmni engine hardcodes `data_parallel_mode="fsdp2"`, and VeOmni asserts `init_device="meta"` for FSDP2, but at
