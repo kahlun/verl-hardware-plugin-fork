@@ -11,6 +11,7 @@ import importlib.util
 import sys
 import types
 
+import pytest
 import torch
 
 
@@ -99,3 +100,45 @@ def test_bridge_skipped_when_veomni_absent(monkeypatch):
     from verl_hardware_plugin.accelerators.xpu.veomni_upstream_bridge import device as bridge
 
     bridge.apply()  # must not raise
+
+
+def test_low_precision_rs_bridge_allows_xpu(monkeypatch, tmp_path):
+    """The CUDA-only gate is a statement in parallelize_model_fsdp2; the bridge recompiles it to allow xpu."""
+    src = (
+        "def get_device_type():\n"
+        "    return DEVICE\n"
+        "\n"
+        "\n"
+        "def parallelize_model_fsdp2(use_low_precision_transport):\n"
+        "    if use_low_precision_transport:\n"
+        '        if get_device_type() != "cuda":\n'
+        '            raise RuntimeError("Low-precision ReduceScatter transport is only supported on CUDA/NCCL.")\n'
+        '    return "sharded"\n'
+    )
+    path = tmp_path / "torch_parallelize.py"
+    path.write_text(src)
+    spec = importlib.util.spec_from_file_location("veomni.distributed.torch_parallelize", path)
+    tp = importlib.util.module_from_spec(spec)
+    tp.DEVICE = "xpu"
+    spec.loader.exec_module(tp)
+    dist = types.ModuleType("veomni.distributed")
+    dist.torch_parallelize = tp
+    for name, mod in (
+        ("veomni", types.ModuleType("veomni")),
+        ("veomni.distributed", dist),
+        ("veomni.distributed.torch_parallelize", tp),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+    by_name = tp.parallelize_model_fsdp2  # build_parallelize_model calls it through the module global
+    with pytest.raises(RuntimeError):
+        by_name(True)
+
+    from verl_hardware_plugin.accelerators.xpu.veomni_upstream_bridge import low_precision_rs as bridge
+
+    importlib.reload(bridge)
+    bridge.apply()
+    assert by_name(True) == "sharded"
+    tp.DEVICE = "npu"
+    with pytest.raises(RuntimeError):
+        by_name(True)  # other devices are still rejected
+    bridge.apply()  # idempotent

@@ -7,11 +7,13 @@ Delete this module once VeOmni's float8 support (#1364 and follow-ups) accepts X
 requires an NVIDIA SM89+ device and rejects ``torch.compile``.
 
 Enable with ``VERL_XPU_VEOMNI_FLOAT8=tensorwise`` (or ``rowwise``). Off by default.
+``VERL_XPU_VEOMNI_FLOAT8_ALLGATHER=1`` (tensorwise only) also all-gathers the FSDP2 weight shards in float8
+and refreshes their scales after every optimizer step. Combine with ``compile_layers.py``
+(``VERL_XPU_VEOMNI_COMPILE=1``) for the compiled path; that needs gradient checkpointing off, because
+compiled float8 under activation checkpointing raises ``CheckpointError``.
 
-Status (CRI, Qwen2.5-1.5B SFT, 2 ranks FSDP2): eager float8 runs and tracks the bf16 loss but is
-slower than bf16 (about 27% at ~9k tokens per card); the compile path is not validated here, and
-the FSDP2 float8 all-gather is not wired. torchao float8 only pays off compiled with a large
-microbatch (see the CRI FP8 report).
+Status (CRI, Qwen2.5-1.5B, 2 ranks FSDP2): float8 runs and tracks the bf16 loss but is slower than bf16,
+eager and compiled. torchao float8 only pays off compiled with a large microbatch (see the CRI FP8 report).
 
 Three things this module handles that torchao alone does not:
 
@@ -31,6 +33,7 @@ import os
 logger = logging.getLogger(__name__)
 
 ENV = "VERL_XPU_VEOMNI_FLOAT8"
+ALLGATHER_ENV = "VERL_XPU_VEOMNI_FLOAT8_ALLGATHER"
 _CALLS = [0]  # Float8Linear forward calls, for verifying float8 actually executes
 
 
@@ -63,7 +66,9 @@ def _pad_token_dim(float8_linear_cls) -> None:
     float8_linear_cls._xpu_pad16 = True
 
 
-def _convert(model, recipe: str):
+def _convert(model, recipe: str, all_gather: bool):
+    import dataclasses
+
     from torchao.float8 import Float8LinearConfig, convert_to_float8_training
     from torchao.float8.float8_linear import Float8Linear
     from veomni.ops.kernels import swiglu_mlp
@@ -72,13 +77,20 @@ def _convert(model, recipe: str):
     _pad_token_dim(Float8Linear)
     convert_to_float8_training(
         model,
-        config=Float8LinearConfig.from_recipe_name(recipe),
+        config=dataclasses.replace(
+            Float8LinearConfig.from_recipe_name(recipe), enable_fsdp_float8_all_gather=all_gather
+        ),
         module_filter_fn=lambda mod, fqn: (
             "lm_head" not in fqn and mod.in_features % 16 == 0 and mod.out_features % 16 == 0
         ),
     )
     n = sum(type(m).__name__ == "Float8Linear" for m in model.modules())
-    logger.warning("float8 training: converted %d Linear -> Float8Linear (recipe=%s)", n, recipe)
+    logger.warning(
+        "float8 training: converted %d Linear -> Float8Linear (recipe=%s, fsdp float8 all-gather=%s)",
+        n,
+        recipe,
+        all_gather,
+    )
     return model
 
 
@@ -93,10 +105,29 @@ def apply() -> None:
     if getattr(engine_impl, "_xpu_float8_applied", False):
         return
 
+    all_gather = os.getenv(ALLGATHER_ENV, "0") == "1"
+    if all_gather and recipe != "tensorwise":
+        raise ValueError(f"{ALLGATHER_ENV}=1 needs the tensorwise recipe, got {recipe!r}")
     orig_build = engine_impl.build_foundation_model
 
     def build_foundation_model(*args, **kwargs):
-        return _convert(orig_build(*args, **kwargs), recipe)
+        return _convert(orig_build(*args, **kwargs), recipe, all_gather)
 
     engine_impl.build_foundation_model = build_foundation_model
+
+    orig_step = engine_impl.VeOmniEngine.optimizer_step
+
+    def optimizer_step(self, *args, **kwargs):
+        out = orig_step(self, *args, **kwargs)
+        if all_gather:
+            from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
+
+            precompute_float8_dynamic_scale_for_fsdp(self.module)
+        if not getattr(self, "_xpu_float8_logged", False):
+            # proof that the float8 GEMMs actually ran (the MLP bypass above would leave this near zero)
+            logger.warning("float8 training: %d Float8Linear forward calls before the first optimizer step", calls())
+            self._xpu_float8_logged = True
+        return out
+
+    engine_impl.VeOmniEngine.optimizer_step = optimizer_step
     engine_impl._xpu_float8_applied = True

@@ -18,9 +18,11 @@ def apply() -> None:
     """Apply every bridge. Idempotent; each module no-ops once VeOmni has the feature."""
     if os.getenv("VERL_XPU_VEOMNI_BRIDGE", "1") == "0":
         return
-    from . import checkpoint_alias, device, float8, hub_fa2
+    from . import checkpoint_alias, compile_layers, device, float8, hub_fa2, low_precision_rs
 
     checkpoint_alias.apply()
     device.apply()
     hub_fa2.apply()
+    low_precision_rs.apply()
     float8.apply()  # opt-in via VERL_XPU_VEOMNI_FLOAT8
+    compile_layers.apply()  # opt-in via VERL_XPU_VEOMNI_COMPILE
