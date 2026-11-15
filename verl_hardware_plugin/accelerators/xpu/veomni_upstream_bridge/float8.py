@@ -15,7 +15,7 @@ compiled float8 under activation checkpointing raises ``CheckpointError``.
 Status (CRI, Qwen2.5-1.5B, 2 ranks FSDP2): float8 runs and tracks the bf16 loss but is slower than bf16,
 eager and compiled. torchao float8 only pays off compiled with a large microbatch (see the CRI FP8 report).
 
-Three things this module handles that torchao alone does not:
+What this module sets up around torchao:
 
 1. ``convert_to_float8_training`` runs on the model VeOmni builds, before FSDP2 wraps it.
 2. VeOmni's fused SwiGLU MLP reads ``gate/up/down_proj.weight`` directly when the projections are
@@ -23,9 +23,8 @@ Three things this module handles that torchao alone does not:
    forward and silently stay bf16. The plain-projection check is swapped to require the exact type
    (VeOmni#1364 makes the same change).
 3. The float8 GEMM needs its inner dimension divisible by 16; in the weight-gradient GEMM that is the token
-   count, which verl's packed variable-length batches do not round. By default ``Float8Linear.forward`` pads
-   the flattened token dim with zero rows and slices the output back (zero rows change neither the output nor
-   the weight gradient). ``VERL_XPU_VEOMNI_FLOAT8_PAD=torchao`` uses torchao's own ``pad_inner_dim`` instead.
+   count, which verl's packed variable-length batches do not round. torchao's ``pad_inner_dim`` pads it (on CRI
+   this gave the same losses, bit for bit, as padding the tokens by hand).
 """
 
 import logging
@@ -35,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 ENV = "VERL_XPU_VEOMNI_FLOAT8"
 ALLGATHER_ENV = "VERL_XPU_VEOMNI_FLOAT8_ALLGATHER"
-PAD_ENV = "VERL_XPU_VEOMNI_FLOAT8_PAD"  # "hook" (default): pad tokens in Float8Linear.forward; "torchao": pad_inner_dim
 _CALLS = [0]  # Float8Linear forward calls, for verifying float8 actually executes
 
 
@@ -48,27 +46,17 @@ def calls() -> int:
     return _CALLS[0]
 
 
-def _wrap_forward(float8_linear_cls, pad_tokens: bool) -> None:
-    """Count Float8Linear calls; with ``pad_tokens`` also pad the flattened token dim to a multiple of 16."""
-    import torch.nn.functional as F
-
-    if getattr(float8_linear_cls, "_xpu_wrapped", False):
+def _count_calls(float8_linear_cls) -> None:
+    if getattr(float8_linear_cls, "_xpu_counted", False):
         return
     orig_forward = float8_linear_cls.forward
 
     def forward(self, x):
         _CALLS[0] += 1
-        if not pad_tokens:
-            return orig_forward(self, x)
-        lead = x.shape[:-1]
-        tokens = x.reshape(-1, x.shape[-1])
-        n = tokens.shape[0]
-        padded = ((n + 15) // 16) * 16
-        y = orig_forward(self, F.pad(tokens, (0, 0, 0, padded - n)))[:n]
-        return y.reshape(*lead, y.shape[-1])
+        return orig_forward(self, x)
 
     float8_linear_cls.forward = forward
-    float8_linear_cls._xpu_wrapped = True
+    float8_linear_cls._xpu_counted = True
 
 
 def _convert(model, recipe: str, all_gather: bool):
@@ -79,14 +67,11 @@ def _convert(model, recipe: str, all_gather: bool):
     from veomni.ops.kernels import swiglu_mlp
 
     swiglu_mlp.has_plain_linear_projections.__code__ = _plain_projections_donor.__code__
-    pad = os.getenv(PAD_ENV, "hook")
-    if pad not in ("hook", "torchao"):
-        raise ValueError(f"{PAD_ENV} must be 'hook' or 'torchao', got {pad!r}")
-    _wrap_forward(Float8Linear, pad_tokens=pad == "hook")
+    _count_calls(Float8Linear)
     config = dataclasses.replace(
         Float8LinearConfig.from_recipe_name(recipe),
         enable_fsdp_float8_all_gather=all_gather,
-        pad_inner_dim=pad == "torchao",
+        pad_inner_dim=True,
     )
     convert_to_float8_training(
         model,
@@ -97,11 +82,10 @@ def _convert(model, recipe: str, all_gather: bool):
     )
     n = sum(type(m).__name__ == "Float8Linear" for m in model.modules())
     logger.warning(
-        "float8 training: converted %d Linear -> Float8Linear (recipe=%s, fsdp float8 all-gather=%s, pad=%s)",
+        "float8 training: converted %d Linear -> Float8Linear (recipe=%s, fsdp float8 all-gather=%s)",
         n,
         recipe,
         all_gather,
-        pad,
     )
     return model
 
