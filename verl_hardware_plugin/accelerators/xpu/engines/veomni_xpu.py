@@ -10,21 +10,18 @@ oneCCL workaround the XPU FSDP engine applies (see ``fsdp_xpu.py``): VeOmni's
 FSDP2 wrappers also default to ReduceOp.AVG, which oneCCL can abort on, so
 force SUM + manual division on every FSDP2 module after initialization.
 
-No core code is patched; this is ordinary subclassing.
+No core code is patched; this is ordinary subclassing. Gaps in VeOmni itself (device
+selection, hub FA2 on XPU) are bridged by ``../veomni_upstream_bridge/``, which is meant to be
+deleted once VeOmni supports XPU upstream.
 """
 
-import importlib
 import logging
 import os
-import sys
 
-try:
-    importlib.import_module("veomni.models.checkpoint_tensor_loading")
-except ModuleNotFoundError:
-    # VeOmni main moved this module to veomni.models.checkpoint.convert (VeOmni#1142,
-    # same functions); verl main still imports the old path. Alias it so the unmodified
-    # core engine module imports against VeOmni main.
-    sys.modules["veomni.models.checkpoint_tensor_loading"] = importlib.import_module("veomni.models.checkpoint.convert")
+from verl_hardware_plugin.accelerators.xpu import veomni_upstream_bridge
+
+# Temporary: lets the engine run on an unmodified VeOmni. Delete with the folder (see its README).
+veomni_upstream_bridge.apply()
 
 from verl.workers.engine.base import EngineRegistry  # noqa: E402
 from verl.workers.engine.veomni.transformer_impl import VeOmniEngineWithLMHead, VeOmniEngineWithValueHead  # noqa: E402
@@ -48,23 +45,54 @@ def _release_xpu_cache() -> None:
     torch.xpu.empty_cache()
 
 
+def _trim_threshold_bytes() -> float:
+    """Reserved-pool size above which the cache is trimmed after a micro-batch.
+
+    VERL_XPU_EMPTY_CACHE_RESERVED_GB sets it in GiB (0 trims after every micro-batch). Otherwise it is
+    VERL_XPU_EMPTY_CACHE_RESERVED_FRACTION (default 1/3) of the card: 8 GiB on a 24 GiB B60, where the
+    allocator was seen to fill the card, and about 50 GiB on a 152 GiB CRI card. A fixed 8 GiB on CRI
+    trimmed after nearly every micro-batch and made VeOmni GRPO actor updates about 1.7x slower.
+    """
+    gb = os.getenv("VERL_XPU_EMPTY_CACHE_RESERVED_GB")
+    if gb is not None:
+        return float(gb) * 1024**3
+    import torch
+
+    fraction = float(os.getenv("VERL_XPU_EMPTY_CACHE_RESERVED_FRACTION", str(1 / 3)))
+    return fraction * torch.xpu.get_device_properties(torch.xpu.current_device()).total_memory
+
+
 def _release_xpu_cache_if_bloated() -> None:
     """Release cached device memory once the allocator's reserved pool exceeds a threshold.
 
     Batches with variable sequence lengths can make the caching allocator reserve new segments
     instead of reusing cached ones. The XPU runtime may fail an allocation without first freeing
-    the cache and retrying, so the pool is trimmed proactively.
-
-    Threshold: VERL_XPU_EMPTY_CACHE_RESERVED_GB (default 8; 0 trims after every micro-batch).
+    the cache and retrying, so the pool is trimmed proactively. Threshold: see _trim_threshold_bytes.
     Set VERL_XPU_EMPTY_CACHE=0 to disable.
     """
     if os.getenv("VERL_XPU_EMPTY_CACHE", "1") == "0":
         return
     import torch
 
-    limit = float(os.getenv("VERL_XPU_EMPTY_CACHE_RESERVED_GB", "8")) * 1024**3
-    if torch.xpu.memory_reserved() > limit:
+    if torch.xpu.memory_reserved() > _trim_threshold_bytes():
         torch.xpu.empty_cache()
+
+
+def _cap_xpu_memory_fraction() -> None:
+    """Cap this process's XPU caching allocator at a fraction of the card (opt-in).
+
+    The xe driver never fails an over-commit, so the allocator never takes its free-cached-and-retry
+    path: reserved memory grows with each distinct micro-batch length until Level Zero raises
+    UR_RESULT_ERROR_OUT_OF_RESOURCES. A per-process fraction makes the allocator release cached
+    blocks at the cap. Alternative to the cache trimming above, from the CRI Qwen3.5 GRPO runs
+    (not yet compared against it on VeOmni). Set VERL_XPU_MEM_FRACTION=0.85 to enable; unset = off.
+    """
+    value = os.getenv("VERL_XPU_MEM_FRACTION")
+    if not value or float(value) <= 0:
+        return
+    import torch
+
+    torch.xpu.set_per_process_memory_fraction(float(value))
 
 
 def _log_xpu_memory(tag: str) -> None:
@@ -109,6 +137,7 @@ class VeOmniXPUEngineWithLMHead(VeOmniEngineWithLMHead):
         return out
 
     def initialize(self):
+        _cap_xpu_memory_fraction()
         super().initialize()
         _force_sum_reduction_on_all_fsdp_modules(self.module)
 
