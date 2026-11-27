@@ -76,12 +76,22 @@ def test_patches_loaded_module_on_b60(monkeypatch):
         assert k.cache == {}
 
 
+def test_cri_gets_its_own_tile(monkeypatch):
+    pytest.importorskip("triton")
+    _patch_env(monkeypatch, name="Intel(R) Graphics [0x674c]")
+    mod = _fake_kernels_module()
+    _apply_to_loaded(monkeypatch, mod)
+    k = getattr(mod, patch_mod._TILED_KERNELS[0])
+    kw = k.configs[0].kwargs
+    assert (kw["BLOCK_SIZE_M"], kw["BLOCK_SIZE_N"], k.configs[0].num_stages) == (128, 256, 3)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
         {"xpu": False},
         {"triton": (3, 8)},
-        {"name": "Intel Graphics 0x674c"},
+        {"name": "Intel(R) Arc(TM) A770 Graphics"},
         {"has_td": False},
     ],
 )
@@ -106,7 +116,7 @@ def test_disable_switch(monkeypatch):
 
 def test_tile_override_lets_unlisted_device_opt_in(monkeypatch):
     pytest.importorskip("triton")
-    _patch_env(monkeypatch, name="Intel Graphics 0x674c")
+    _patch_env(monkeypatch, name="Intel(R) Arc(TM) A770 Graphics")
     monkeypatch.setenv("VERL_XPU_FUSED_LOGPROB_TILE", "128,128,32,8,3")
     mod = _fake_kernels_module()
     _apply_to_loaded(monkeypatch, mod)

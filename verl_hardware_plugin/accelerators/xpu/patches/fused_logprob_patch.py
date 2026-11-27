@@ -24,7 +24,7 @@ XPU keeps verl's original behaviour. Add a row after measuring a device, do not 
 
 Gates (all must hold, otherwise this is a no-op and logs why at INFO):
 - `VERL_XPU_FUSED_LOGPROB_PATCH` is not "0";
-- torch.xpu is available and the device name matches a row of `_TILES`;
+- torch.xpu is available and the device name contains a key of `_TILES`;
 - Triton >= 3.9 and `tl.make_tensor_descriptor` exists.
 
 `VERL_XPU_FUSED_LOGPROB_TILE="BM,BN,BK,warps,stages"` overrides the table (also lets an unlisted
@@ -53,8 +53,12 @@ _TILED_KERNELS = (
     "efficient_entropy_backward_kernel_general_d_logits_split_N",
 )
 # device-name substring -> (BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_warps, num_stages)
-# B60: best of a 5-tile sweep at 4096 tokens (Triton 3.9.0). Other devices are not measured.
-_TILES = {"B60": (64, 128, 32, 16, 2)}
+# Best tile per device from a sweep of verl's kernels (Triton 3.9.0, fwd + bwd):
+# - B60: best of 5 tiles at 4096 tokens (123 ms; the CRI tile below was not tried there).
+# - CRI (device id 0x674c): best of 10 tiles at 4096 tokens (30 ms) and of 3 at 16384 (117 ms); the B60 tile
+#   takes 46 ms there, so tiles do not transfer between devices.
+# Other devices are not measured and keep verl's defaults.
+_TILES = {"B60": (64, 128, 32, 16, 2), "0x674c": (128, 256, 32, 16, 3)}
 _MIN_TRITON = (3, 9)
 
 
