@@ -57,8 +57,9 @@ _TILED_KERNELS = (
 # - B60: best of 5 tiles at 4096 tokens (123 ms; the CRI tile below was not tried there).
 # - CRI (device id 0x674c): best of 10 tiles at 4096 tokens (30 ms) and of 3 at 16384 (117 ms); the B60 tile
 #   takes 46 ms there, so tiles do not transfer between devices.
+# - B70: tested by a maintainer on a B70; the same tile as B60 was kept.
 # Other devices are not measured and keep verl's defaults.
-_TILES = {"B60": (64, 128, 32, 16, 2), "0x674c": (128, 256, 32, 16, 3)}
+_TILES = {"B60": (64, 128, 32, 16, 2), "B70": (64, 128, 32, 16, 2), "0x674c": (128, 256, 32, 16, 3)}
 _MIN_TRITON = (3, 9)
 
 

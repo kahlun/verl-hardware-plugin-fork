@@ -76,6 +76,16 @@ def test_patches_loaded_module_on_b60(monkeypatch):
         assert k.cache == {}
 
 
+def test_b70_gets_the_b60_tile(monkeypatch):
+    pytest.importorskip("triton")
+    _patch_env(monkeypatch, name="Intel(R) Arc(TM) Pro B70 Graphics")
+    mod = _fake_kernels_module()
+    _apply_to_loaded(monkeypatch, mod)
+    k = getattr(mod, patch_mod._TILED_KERNELS[0])
+    kw = k.configs[0].kwargs
+    assert (kw["BLOCK_SIZE_M"], kw["BLOCK_SIZE_N"], k.configs[0].num_stages) == (64, 128, 2)
+
+
 def test_cri_gets_its_own_tile(monkeypatch):
     pytest.importorskip("triton")
     _patch_env(monkeypatch, name="Intel(R) Graphics [0x674c]")
